@@ -71,6 +71,7 @@ class LaneNet:
     conn_src: np.ndarray       # [n_conn] int32, 송신 lane
     conn_dst: np.ndarray       # [n_conn] int32, 수신 lane
     conn_split: np.ndarray     # [n_conn] float32, 송신 측 분배 비율(1/outdeg)
+    conn_priority: np.ndarray  # [n_conn] int8, 1=major('M'/대문자/'='), 0=minor('m')
 
 
 def load_lane_net(net_file: Path) -> LaneNet:
@@ -137,6 +138,7 @@ def load_lane_net(net_file: Path) -> LaneNet:
     caps = np.zeros(n_lanes, dtype=np.int32)
     out_count = np.zeros(n_lanes, dtype=np.int32)
     raw_conns: list[tuple[int, int]] = []  # (src_lane, dst_lane)
+    raw_state: list[str] = []              # 같은 인덱스의 connection state(첫 글자)
 
     for c in root.findall("connection"):
         f = c.get("from", "")
@@ -152,6 +154,8 @@ def load_lane_net(net_file: Path) -> LaneNet:
         if src is None or dst is None:
             continue
         raw_conns.append((src, dst))
+        state_str = c.get("state", "M")
+        raw_state.append(state_str[:1] if state_str else "M")
         out_count[src] += 1
         b = dir_to_bit(c.get("dir", ""))
         if b >= 0:
@@ -161,6 +165,9 @@ def load_lane_net(net_file: Path) -> LaneNet:
     conn_src_list = [s for s, _ in raw_conns]
     conn_dst_list = [d for _, d in raw_conns]
     conn_split_list = [1.0 / max(int(out_count[s]), 1) for s, _ in raw_conns]
+    # 우선권(priority): SUMO connection.state = 'M'(주도로) → 1, 'm'(소도로/양보) → 0,
+    # 그 외('=' 항시통행, 'L','R' 등 대문자) → 1 (default major).
+    conn_priority_list = [1 if (s and (s.isupper() or s == '=')) else 0 for s in raw_state]
 
     incoming: list[list[tuple[int, float]]] = [[] for _ in range(n_lanes)]
     for src, dst in raw_conns:
@@ -234,6 +241,7 @@ def load_lane_net(net_file: Path) -> LaneNet:
         conn_src=np.asarray(conn_src_list, dtype=np.int32),
         conn_dst=np.asarray(conn_dst_list, dtype=np.int32),
         conn_split=np.asarray(conn_split_list, dtype=np.float32),
+        conn_priority=np.asarray(conn_priority_list, dtype=np.int8),
     )
 
 

@@ -130,14 +130,29 @@ def ctm_step(
 
     # 연결별 demand
     D = S[net.conn_src] * net.conn_split
-    # 수신측 총 demand
-    total_demand = np.zeros_like(rho)
-    np.add.at(total_demand, net.conn_dst, D)
-    # 수신측 축소 계수
-    scale = np.divide(R, total_demand, out=np.ones_like(R), where=total_demand > 0.0)
-    scale = np.minimum(scale, 1.0)
-    # 실제 연결 flux
-    Q = D * scale[net.conn_dst]
+
+    # 우선권(priority/yield) 머지: major('M', 우선권)가 수신용량을 먼저 차지하고,
+    # minor('m', 양보)는 남은 잔여 용량만 받는다. 양쪽 모두 scatter-add로 수신측 집계.
+    pri = net.conn_priority.astype(bool)
+    D_major = np.where(pri, D, 0.0)
+    D_minor = np.where(pri, 0.0, D)
+
+    tot_major = np.zeros_like(rho)
+    tot_minor = np.zeros_like(rho)
+    np.add.at(tot_major, net.conn_dst, D_major)
+    np.add.at(tot_minor, net.conn_dst, D_minor)
+
+    # major 측 수신 축소율 = min(1, R / tot_major)
+    scale_major = np.minimum(1.0,
+        np.divide(R, tot_major, out=np.ones_like(R), where=tot_major > 0.0))
+    served_major = tot_major * scale_major                     # 실제 major 수신량
+    residual = np.maximum(R - served_major, 0.0)               # 잔여 용량
+    scale_minor = np.minimum(1.0,
+        np.divide(residual, tot_minor, out=np.ones_like(residual), where=tot_minor > 0.0))
+
+    # 연결별 실제 flux
+    scale_per_conn = np.where(pri, scale_major[net.conn_dst], scale_minor[net.conn_dst])
+    Q = D * scale_per_conn
 
     # lane별 inflow/outflow (scatter-add)
     inflow = np.zeros_like(rho)
