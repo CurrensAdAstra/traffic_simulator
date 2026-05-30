@@ -109,7 +109,8 @@ def run_sim(args) -> None:
 
     rho_jam = np.float32(args.jam_density_per_lane)
 
-    source_demand_np, target_share_np, veh_n = build_demand_and_target(
+    # GPU 커널은 아직 균등 split(net.conn_split)을 사용 — conn_split_cal는 무시.
+    source_demand_np, target_share_np, _conn_split_cal, veh_n = build_demand_and_target(
         net, Path(args.net_file), Path(args.route_file) if args.route_file else None,
         args.sim_duration, args.source_demand,
     )

@@ -112,6 +112,7 @@ def ctm_step(
     lat_src_expand: np.ndarray,
     no_incoming_mask: np.ndarray,
     no_outgoing_mask: np.ndarray,
+    conn_split: np.ndarray,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """벡터화된 CTM(Daganzo, 1994) 한 스텝.
 
@@ -128,8 +129,8 @@ def ctm_step(
     S = np.where(rho <= rho_c, q, q_max)
     R = np.where(rho >= rho_c, q, q_max)
 
-    # 연결별 demand
-    D = S[net.conn_src] * net.conn_split
+    # 연결별 demand (route-기반 보정된 conn_split 사용)
+    D = S[net.conn_src] * conn_split
 
     # 우선권(priority/yield) 머지: major('M', 우선권)가 수신용량을 먼저 차지하고,
     # minor('m', 양보)는 남은 잔여 용량만 받는다. 양쪽 모두 scatter-add로 수신측 집계.
@@ -216,7 +217,7 @@ def run_sim(args) -> None:
     flow = np.zeros_like(rho)
     flow_next = np.zeros_like(rho)
 
-    source_demand, target_share, veh_n = build_demand_and_target(
+    source_demand, target_share, conn_split_cal, veh_n = build_demand_and_target(
         net, Path(args.net_file), Path(args.route_file) if args.route_file else None,
         args.sim_duration, args.source_demand,
     )
@@ -287,7 +288,7 @@ def run_sim(args) -> None:
         rho, speed, flow = ctm_step(
             net, rho, net.vmax_mps, rho_jam, net.length_m, args.dt,
             source_demand, target_share, args.lane_change_rate,
-            lat_src_expand, no_incoming_mask, no_outgoing_mask,
+            lat_src_expand, no_incoming_mask, no_outgoing_mask, conn_split_cal,
         )
 
     t0 = time.perf_counter()
@@ -300,7 +301,7 @@ def run_sim(args) -> None:
             rho, speed, flow = ctm_step(
                 net, rho, net.vmax_mps, rho_jam, net.length_m, args.dt,
                 source_demand, target_share, args.lane_change_rate,
-                lat_src_expand, no_incoming_mask, no_outgoing_mask,
+                lat_src_expand, no_incoming_mask, no_outgoing_mask, conn_split_cal,
             )
 
         if args.time_average:

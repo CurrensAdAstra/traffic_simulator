@@ -269,18 +269,19 @@ def build_demand_and_target(
     route_file: Path | None,
     sim_duration: float,
     source_demand_default: float,
-) -> tuple[np.ndarray, np.ndarray, int]:
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, int]:
     """
     route 파일로부터:
       - source_demand[L]: 진입 차선별 inflow 비율(veh/s). route의 첫 edge에 진입.
       - target_share[L]: edge 내 lane별 목표 밀도 비중(회전 수요 기반, edge별 합=1).
-    route가 없으면 source_demand는 상수 fallback, target_share는 균등 분배.
-    반환: (source_demand, target_share, vehicle_count)
+      - conn_split_cal[n_conn]: route 사용 빈도 기반 회전비율(송신 lane별 합=1).
+        route가 없거나 송신 lane의 모든 출력이 route에서 미사용이면 균등(1/outdeg) fallback.
+    반환: (source_demand, target_share, conn_split_cal, vehicle_count)
     """
     L = net.n_lanes
     E = net.n_edges
 
-    # 기본값(균등 target, 상수 source)
+    # 기본값(균등 target, 상수 source, 균등 conn_split)
     target_share = np.zeros(L, dtype=np.float32)
     for ei in range(E):
         s = int(net.edge_lane_ptr[ei])
@@ -290,10 +291,11 @@ def build_demand_and_target(
             target_share[net.edge_lanes[s:e]] = 1.0 / k
 
     source_demand = np.full(L, float(source_demand_default), dtype=np.float32)
+    conn_split_cal = net.conn_split.copy()  # 기본 = 균등 (load_lane_net의 1/outdeg)
 
     if route_file is None or not Path(route_file).exists():
-        log("route_file 없음: 균등 target_share + 상수 source_demand 사용")
-        return source_demand, target_share, 0
+        log("route_file 없음: 균등 target_share + 상수 source_demand + 균등 conn_split 사용")
+        return source_demand, target_share, conn_split_cal, 0
 
     route_file = Path(route_file)
     pair_dir = _build_edge_pair_dir(net_file, net.edge_to_idx)
@@ -312,6 +314,7 @@ def build_demand_and_target(
     # pass2: route별 edge열 → 첫 edge 수요 + 회전 수요 집계(차량 수 가중)
     edge_first_demand = np.zeros(E, dtype=np.float64)         # edge별 진입 차량 수
     turn_dem = np.zeros((E, 4), dtype=np.float64)             # edge별 방향(L/S/R/T) 수요
+    pair_count: Counter[tuple[int, int]] = Counter()          # (from_edge, to_edge) → 차량 가중 수
     for _, el in ET.iterparse(route_file, events=("end",)):
         if el.tag != "route":
             el.clear()
@@ -331,6 +334,7 @@ def build_demand_and_target(
                 ib = net.edge_to_idx.get(b)
                 if ia is None or ib is None:
                     continue
+                pair_count[(ia, ib)] += w
                 d = pair_dir.get((ia, ib))
                 if d is not None:
                     turn_dem[ia, d] += w
@@ -380,8 +384,40 @@ def build_demand_and_target(
             acc[:] = 1.0 / k
         target_share[lanes] = acc.astype(np.float32)
 
-    log(f"route 반영: vehicles={vehicle_count}, routes={len(veh_count)}, sim_duration={sim_duration}")
-    return source_demand, target_share, vehicle_count
+    # conn_split_cal[n_conn]: (from_edge, to_edge) 사용량에서 송신 lane 정규화
+    # 같은 (from,to) 쌍을 여러 connection(lane 조합)이 공유하므로, 우선 쌍의 차량 수요를
+    # 그 쌍을 담당하는 connection 수로 균등 분배한 raw 수요를 만든다.
+    n_conn = net.n_conn
+    src_edge_arr = net.lane_edge[net.conn_src]
+    dst_edge_arr = net.lane_edge[net.conn_dst]
+    pair_keys = list(zip(src_edge_arr.tolist(), dst_edge_arr.tolist()))
+    pair_n_conn: Counter[tuple[int, int]] = Counter(pair_keys)
+
+    raw = np.zeros(n_conn, dtype=np.float64)
+    for k in range(n_conn):
+        key = pair_keys[k]
+        cnt = pair_count.get(key, 0)
+        nc = pair_n_conn[key]
+        if cnt > 0 and nc > 0:
+            raw[k] = cnt / nc
+
+    # 송신 lane별 합으로 정규화 — 송신 lane의 모든 출력이 route에서 미사용이면 균등 fallback
+    sum_src = np.zeros(L, dtype=np.float64)
+    np.add.at(sum_src, net.conn_src, raw)
+    src_sum_per_conn = sum_src[net.conn_src]
+    has_data = src_sum_per_conn > 0
+    conn_split_cal = np.where(
+        has_data,
+        raw / np.where(src_sum_per_conn > 0, src_sum_per_conn, 1.0),
+        net.conn_split,  # fallback 균등(1/outdeg)
+    ).astype(np.float32)
+
+    n_calibrated_lanes = int((sum_src > 0).sum())
+    log(
+        f"route 반영: vehicles={vehicle_count}, routes={len(veh_count)}, "
+        f"sim_duration={sim_duration}, conn_split 보정된 송신 lane={n_calibrated_lanes}/{L}"
+    )
+    return source_demand, target_share, conn_split_cal, vehicle_count
 
 
 def aggregate_to_edges(
