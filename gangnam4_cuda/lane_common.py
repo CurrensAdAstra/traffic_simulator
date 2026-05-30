@@ -72,6 +72,11 @@ class LaneNet:
     conn_dst: np.ndarray       # [n_conn] int32, 수신 lane
     conn_split: np.ndarray     # [n_conn] float32, 송신 측 분배 비율(1/outdeg)
     conn_priority: np.ndarray  # [n_conn] int8, 1=major('M'/대문자/'='), 0=minor('m')
+    # 연결의 수신/송신 측 CSR — gather-only GPU 커널용(atomicAdd 제거)
+    in_conn_ptr: np.ndarray    # [n_lanes+1] int32, 수신 lane별 incoming connection 시작/끝
+    in_conn_idx: np.ndarray    # [n_conn] int32, in_conn_ptr 기준 connection index
+    out_conn_ptr: np.ndarray   # [n_lanes+1] int32, 송신 lane별 outgoing connection 시작/끝
+    out_conn_idx: np.ndarray   # [n_conn] int32, out_conn_ptr 기준 connection index
 
 
 def load_lane_net(net_file: Path) -> LaneNet:
@@ -214,6 +219,17 @@ def load_lane_net(net_file: Path) -> LaneNet:
                 lat_neighbors.append(nb)
         lat_ptr.append(len(lat_neighbors))
 
+    # 연결의 수신/송신 측 CSR 빌드 — gather-only GPU 커널에서 사용
+    conn_src_arr = np.asarray(conn_src_list, dtype=np.int32)
+    conn_dst_arr = np.asarray(conn_dst_list, dtype=np.int32)
+    in_count = np.bincount(conn_dst_arr, minlength=n_lanes)
+    out_count_arr = np.bincount(conn_src_arr, minlength=n_lanes)
+    in_conn_ptr = np.concatenate([[0], np.cumsum(in_count)]).astype(np.int32)
+    out_conn_ptr = np.concatenate([[0], np.cumsum(out_count_arr)]).astype(np.int32)
+    # stable sort: 같은 src/dst 그룹 안에서 원본 connection 순서 유지
+    in_conn_idx = np.argsort(conn_dst_arr, kind="stable").astype(np.int32)
+    out_conn_idx = np.argsort(conn_src_arr, kind="stable").astype(np.int32)
+
     log(
         f"lane net 로드 완료: edges={n_edges}, lanes={n_lanes}, "
         f"connections={len(raw_conns)}, lat_edges={len(lat_neighbors)}"
@@ -238,10 +254,14 @@ def load_lane_net(net_file: Path) -> LaneNet:
         edge_lane_ptr=np.asarray(edge_lane_ptr, dtype=np.int32),
         edge_lanes=np.asarray(edge_lanes_flat, dtype=np.int32),
         n_conn=len(raw_conns),
-        conn_src=np.asarray(conn_src_list, dtype=np.int32),
-        conn_dst=np.asarray(conn_dst_list, dtype=np.int32),
+        conn_src=conn_src_arr,
+        conn_dst=conn_dst_arr,
         conn_split=np.asarray(conn_split_list, dtype=np.float32),
         conn_priority=np.asarray(conn_priority_list, dtype=np.int8),
+        in_conn_ptr=in_conn_ptr,
+        in_conn_idx=in_conn_idx,
+        out_conn_ptr=out_conn_ptr,
+        out_conn_idx=out_conn_idx,
     )
 
 
