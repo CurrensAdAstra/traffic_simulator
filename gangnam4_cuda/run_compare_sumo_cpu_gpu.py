@@ -121,7 +121,14 @@ def read_edge_metric_map(edge_csv: Path) -> Dict[str, dict[str, float]]:
 
 
 def parse_sumo_edgedata_last_interval(edgedata_file: Path) -> Dict[str, dict[str, float]]:
-    """SUMO edgedata xml에서 마지막 interval의 edge 지표를 읽는다."""
+    """SUMO edgedata xml에서 마지막 interval의 edge 지표를 읽는다.
+
+    단위 정규화: SUMO edgeData는 density를 veh/km, flow를 veh/h로 보고하므로
+    엔진 출력(veh/m, veh/s)과 일치시키기 위해 여기서 환산한다.
+      - density: veh/km  → veh/m  (÷1000)
+      - flow:    veh/h   → veh/s  (÷3600)
+      - speed:   m/s     (그대로)
+    """
     tree = ET.parse(edgedata_file)
     root = tree.getroot()
     intervals = root.findall("interval")
@@ -134,11 +141,13 @@ def parse_sumo_edgedata_last_interval(edgedata_file: Path) -> Dict[str, dict[str
         eid = e.get("id", "")
         if not eid:
             continue
+        density_per_km = float(e.get("density", "0") or 0.0)
+        flow_per_h = float(e.get("flow", "0") or 0.0)
         out[eid] = {
             "speed_mps": float(e.get("speed", "0") or 0.0),
             "travel_time_s": float(e.get("traveltime", "0") or 0.0),
-            "density_veh_per_m": float(e.get("density", "0") or 0.0),
-            "flow_veh_per_s": float(e.get("flow", "0") or 0.0),
+            "density_veh_per_m": density_per_km / 1000.0,
+            "flow_veh_per_s": flow_per_h / 3600.0,
             "sampled_seconds": float(e.get("sampledSeconds", "0") or 0.0),
         }
     return out
@@ -170,7 +179,10 @@ def write_edgewise_report(
         "abs_err_gpu_travel_time",
     ]
     path.parent.mkdir(parents=True, exist_ok=True)
-    edges = sorted(set(sumo_edge.keys()) & set(cpu_edge.keys()) & set(gpu_edge.keys()))
+    # SUMO가 차량을 관측한 edge(sampledSeconds>0)만 비교 — 미관측 edge는 0으로 채워져 있어
+    # 엔진의 비제로 값과 비교하면 오차 통계가 왜곡됨.
+    sumo_observed = {eid for eid, v in sumo_edge.items() if v.get("sampled_seconds", 0.0) > 0.0}
+    edges = sorted(sumo_observed & set(cpu_edge.keys()) & set(gpu_edge.keys()))
 
     with path.open("w", newline="", encoding="utf-8") as f:
         w = csv.DictWriter(f, fieldnames=fieldnames)

@@ -262,13 +262,8 @@ def main() -> None:
             edgedata = run_sumo_edgedata(args, out_prefix)
         else:
             fail("기준 미지정: --sumo-edgedata / --run-sumo / --ref-edge-csv 중 하나 필요")
+        # 단위 정규화(veh/km→veh/m, veh/h→veh/s)는 parse 함수가 처리. 여기선 관측 edge만 추림.
         sumo_map = parse_sumo_edgedata_last_interval(edgedata)
-        # SUMO edgeData 단위 변환 + 관측 edge만 사용:
-        #   density: veh/km  → veh/m  (÷1000)
-        #   flow:    veh/h   → veh/s  (÷3600)
-        #   speed:   m/s     (그대로)
-        # sampledSeconds<=0 인 edge는 SUMO가 차량을 관측하지 못한 것이므로 비교에서 제외
-        #   (제외하지 않으면 lane 엔진의 비어있지 않은 값과 SUMO의 0을 비교하게 됨)
         ref_metrics = {}
         skipped = 0
         for eid, v in sumo_map.items():
@@ -277,11 +272,11 @@ def main() -> None:
                 continue
             ref_metrics[eid] = {
                 "speed_mps": v.get("speed_mps", 0.0),
-                "density_veh_per_m": v.get("density_veh_per_m", 0.0) / 1000.0,
-                "flow_veh_per_s": v.get("flow_veh_per_s", 0.0) / 3600.0,
+                "density_veh_per_m": v.get("density_veh_per_m", 0.0),
+                "flow_veh_per_s": v.get("flow_veh_per_s", 0.0),
             }
         ref_name = "SUMO"
-        log(f"SUMO 관측 edge={len(ref_metrics)} (미관측 {skipped}개 제외, 단위 veh/km→veh/m·veh/h→veh/s 변환)")
+        log(f"SUMO 관측 edge={len(ref_metrics)} (미관측 {skipped}개 제외)")
     log(f"기준({ref_name}) edge 지표: {len(ref_metrics)}개 edge")
 
     # 3) 비교
