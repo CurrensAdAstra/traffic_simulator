@@ -66,6 +66,11 @@ class LaneNet:
     # edge→lane 매핑 (집계/검증용)
     edge_lane_ptr: np.ndarray  # [n_edges+1] int32
     edge_lanes: np.ndarray     # [L] int32, edge별 lane 전역 인덱스(정렬)
+    # 연결(connection) 평탄 배열 — CTM(sending/receiving) 갱신에 사용
+    n_conn: int
+    conn_src: np.ndarray       # [n_conn] int32, 송신 lane
+    conn_dst: np.ndarray       # [n_conn] int32, 수신 lane
+    conn_split: np.ndarray     # [n_conn] float32, 송신 측 분배 비율(1/outdeg)
 
 
 def load_lane_net(net_file: Path) -> LaneNet:
@@ -152,6 +157,11 @@ def load_lane_net(net_file: Path) -> LaneNet:
         if b >= 0:
             caps[src] |= (1 << b)
 
+    # 연결 평탄 배열(원본 순서 유지) — CTM 갱신용
+    conn_src_list = [s for s, _ in raw_conns]
+    conn_dst_list = [d for _, d in raw_conns]
+    conn_split_list = [1.0 / max(int(out_count[s]), 1) for s, _ in raw_conns]
+
     incoming: list[list[tuple[int, float]]] = [[] for _ in range(n_lanes)]
     for src, dst in raw_conns:
         w = 1.0 / max(int(out_count[src]), 1)
@@ -220,6 +230,10 @@ def load_lane_net(net_file: Path) -> LaneNet:
         lat_neighbors=np.asarray(lat_neighbors, dtype=np.int32),
         edge_lane_ptr=np.asarray(edge_lane_ptr, dtype=np.int32),
         edge_lanes=np.asarray(edge_lanes_flat, dtype=np.int32),
+        n_conn=len(raw_conns),
+        conn_src=np.asarray(conn_src_list, dtype=np.int32),
+        conn_dst=np.asarray(conn_dst_list, dtype=np.int32),
+        conn_split=np.asarray(conn_split_list, dtype=np.float32),
     )
 
 

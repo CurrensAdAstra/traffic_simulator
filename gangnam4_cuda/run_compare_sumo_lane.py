@@ -77,6 +77,7 @@ def read_edge_metric_csv(path: Path) -> EdgeMetrics:
 def run_lane_engine(args, lane_edge_csv: Path) -> None:
     """lane CPU 엔진을 실행해 edge 집계 CSV를 생성."""
     lane_csv = lane_edge_csv.with_suffix(".lane.csv")
+    # SUMO 검증 기본: CTM 모델 + 시간평균 + SUMO와 같은 sim_time
     cmd = [
         sys.executable,
         str(_HERE / "lane_cpu_simulator_mt.py"),
@@ -85,9 +86,13 @@ def run_lane_engine(args, lane_edge_csv: Path) -> None:
         "--dt", str(args.dt),
         "--lane-change-rate", str(args.lane_change_rate),
         "--sim-duration", str(args.duration_sec),
+        "--model", args.model,
+        "--sim-time", str(args.engine_sim_time if args.engine_sim_time > 0 else args.duration_sec),
         "--output-csv", str(lane_csv),
         "--edge-output-csv", str(lane_edge_csv),
     ]
+    if args.time_average:
+        cmd.append("--time-average")
     if args.route_file:
         cmd += ["--route-file", str(args.route_file)]
     log("CMD: " + " ".join(cmd))
@@ -226,6 +231,14 @@ def main() -> None:
     p.add_argument("--lane-change-rate", type=float, default=0.5)
     p.add_argument("--topk", type=int, default=50, help="혼잡 hotspot 일치도 비교 edge 수")
     p.add_argument("--out-prefix", default="./gangnam4_cuda/results/compare_lane")
+    # lane 엔진 모델 옵션(SUMO와 공정 비교를 위한 기본값)
+    p.add_argument("--model", default="ctm", choices=["lwr", "ctm"],
+                   help="lane 엔진 갱신 모델(기본 ctm: spillback 포함)")
+    p.add_argument("--time-average", action="store_true", default=True,
+                   help="lane 엔진 결과를 시간평균하여 SUMO edgeData와 정렬(기본 ON)")
+    p.add_argument("--no-time-average", action="store_false", dest="time_average")
+    p.add_argument("--engine-sim-time", type=float, default=0.0,
+                   help="lane 엔진의 모델 시뮬레이션 시간(초). 0이면 --duration-sec와 동일하게 정렬")
     # 기준(reference) 선택: 셋 중 하나
     p.add_argument("--sumo-edgedata", default=None, help="기존 SUMO edgedata xml 경로")
     p.add_argument("--run-sumo", action="store_true", help="SUMO를 직접 실행해 edgedata 생성")

@@ -99,6 +99,81 @@ def lateral_chunk(
         flow_next[i] = r * v
 
 
+def ctm_step(
+    net: LaneNet,
+    rho: np.ndarray,
+    vmax: np.ndarray,
+    rho_jam: float,
+    length: np.ndarray,
+    dt: float,
+    source_demand: np.ndarray,
+    target_share: np.ndarray,
+    k_lc: float,
+    lat_src_expand: np.ndarray,
+    no_incoming_mask: np.ndarray,
+    no_outgoing_mask: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """벡터화된 CTM(Daganzo, 1994) 한 스텝.
+
+    Greenshields parabolic FD에서:
+      q(rho) = rho*vmax*(1 - rho/rho_jam),  rho_c = rho_jam/2,  q_max = vmax*rho_jam/4
+      S(rho) = q(rho)             if rho <= rho_c else q_max     (송신 demand)
+      R(rho) = q_max              if rho <= rho_c else q(rho)    (수신 supply)
+    연결별 demand D_k = S[src] * split_k, 수신측에서 R[j]를 초과하면 비례 축소 → 실제 flux.
+    질량보존: 각 연결 flux는 송신 측 outflow와 수신 측 inflow에 동일 부호로 반영.
+    """
+    rho_c = rho_jam * 0.5
+    q_max = vmax * (rho_jam * 0.25)                 # vmax*rho_c*(1-rho_c/rho_jam)
+    q = rho * vmax * (1.0 - rho / rho_jam)
+    S = np.where(rho <= rho_c, q, q_max)
+    R = np.where(rho >= rho_c, q, q_max)
+
+    # 연결별 demand
+    D = S[net.conn_src] * net.conn_split
+    # 수신측 총 demand
+    total_demand = np.zeros_like(rho)
+    np.add.at(total_demand, net.conn_dst, D)
+    # 수신측 축소 계수
+    scale = np.divide(R, total_demand, out=np.ones_like(R), where=total_demand > 0.0)
+    scale = np.minimum(scale, 1.0)
+    # 실제 연결 flux
+    Q = D * scale[net.conn_dst]
+
+    # lane별 inflow/outflow (scatter-add)
+    inflow = np.zeros_like(rho)
+    outflow = np.zeros_like(rho)
+    np.add.at(inflow, net.conn_dst, Q)
+    np.add.at(outflow, net.conn_src, Q)
+
+    # 진입 lane(상류 없음)에만 source_demand 주입(네트워크 외부에서 유입)
+    inflow = inflow + np.where(no_incoming_mask, source_demand, 0.0)
+
+    # 출구 lane(하류 없음)는 네트워크 외부로 sink 방출 — S(rho)만큼 자유 유출
+    # (이걸 빼면 sink lane에 mass가 무한 축적되어 CTM이 다 막힘)
+    outflow = outflow + np.where(no_outgoing_mask, S, 0.0)
+
+    # 종방향 갱신 — length는 CFL 안정성을 위해 dt*vmax 이상으로 클램프
+    # (짧은 lane은 명시적 Euler에서 발산하므로 효과적 길이를 늘려 안정화. 질량보존 유지.)
+    length_eff = np.maximum(length, dt * vmax)
+    rho_long = rho + dt * (inflow - outflow) / length_eff
+    np.clip(rho_long, 0.0, rho_jam, out=rho_long)
+
+    # 횡방향(차선변경) — 기존 회전 수요 기반 완화, 벡터화
+    edge_rho = np.zeros(net.n_edges, dtype=rho.dtype)
+    np.add.at(edge_rho, net.lane_edge, rho_long)
+    phi = rho_long - target_share * edge_rho[net.lane_edge]
+    deg = (net.lat_ptr[1:] - net.lat_ptr[:-1]).astype(rho.dtype)
+    sum_phi_nb = np.zeros_like(rho)
+    np.add.at(sum_phi_nb, lat_src_expand, phi[net.lat_neighbors])
+    lat = sum_phi_nb - phi * deg
+
+    rho_next = rho_long + dt * k_lc * lat
+    np.clip(rho_next, 0.0, rho_jam, out=rho_next)
+    speed = np.maximum(vmax * (1.0 - rho_next / rho_jam), 0.0)
+    flow_next = rho_next * speed
+    return rho_next, speed, flow_next
+
+
 def run_sim(args) -> None:
     net = load_lane_net(Path(args.net_file))
     n = net.n_lanes
@@ -130,10 +205,34 @@ def run_sim(args) -> None:
         net, Path(args.net_file), Path(args.route_file) if args.route_file else None,
         args.sim_duration, args.source_demand,
     )
-    log(f"수요/목표분배 준비 완료: vehicles={veh_n}, lane-change-rate={args.lane_change_rate}")
+    # --sim-time이 주어지면 steps를 sim_time/dt로 재계산
+    steps = args.steps
+    if args.sim_time and args.sim_time > 0:
+        steps = max(1, int(round(args.sim_time / args.dt)))
+        log(f"sim_time={args.sim_time}s 적용: steps={steps} (dt={args.dt})")
+    model = args.model.lower()
+    if model not in {"lwr", "ctm"}:
+        raise SystemExit(f"unknown --model: {args.model}")
+    log(f"모델={model}, time_average={bool(args.time_average)}, steps={steps}, "
+        f"vehicles={veh_n}, lane-change-rate={args.lane_change_rate}")
 
     lane_edge = net.lane_edge
     edge_rho = np.zeros(net.n_edges, dtype=np.float32)
+    # CTM에 필요한 precompute
+    lat_src_expand = np.repeat(
+        np.arange(n, dtype=np.int32),
+        (net.lat_ptr[1:] - net.lat_ptr[:-1]).astype(np.int64),
+    )
+    no_incoming_mask = (net.in_ptr[1:] - net.in_ptr[:-1]) == 0
+    # 출구(sink) lane: 송신 conn_src에 한 번도 등장하지 않는 lane
+    out_degree = np.bincount(net.conn_src, minlength=n)
+    no_outgoing_mask = out_degree == 0
+    log(f"진입 lane={int(no_incoming_mask.sum())}, 출구 lane={int(no_outgoing_mask.sum())}")
+    # 시간평균 누적기
+    rho_acc = np.zeros(n, dtype=np.float64) if args.time_average else None
+    speed_acc = np.zeros(n, dtype=np.float64) if args.time_average else None
+    flow_acc = np.zeros(n, dtype=np.float64) if args.time_average else None
+    t_acc = 0.0
 
     def run_step() -> None:
         # phase 1: 종방향
@@ -165,24 +264,50 @@ def run_sim(args) -> None:
                 f.result()
 
     # 초기 1스텝(flow/speed 정렬)
-    run_step()
-    rho, rho_next = rho_next, rho
-    flow, flow_next = flow_next, flow
-
-    t0 = time.perf_counter()
-    for step in range(args.steps):
+    if model == "lwr":
         run_step()
         rho, rho_next = rho_next, rho
         flow, flow_next = flow_next, flow
+    else:
+        rho, speed, flow = ctm_step(
+            net, rho, net.vmax_mps, rho_jam, net.length_m, args.dt,
+            source_demand, target_share, args.lane_change_rate,
+            lat_src_expand, no_incoming_mask, no_outgoing_mask,
+        )
+
+    t0 = time.perf_counter()
+    for step in range(steps):
+        if model == "lwr":
+            run_step()
+            rho, rho_next = rho_next, rho
+            flow, flow_next = flow_next, flow
+        else:
+            rho, speed, flow = ctm_step(
+                net, rho, net.vmax_mps, rho_jam, net.length_m, args.dt,
+                source_demand, target_share, args.lane_change_rate,
+                lat_src_expand, no_incoming_mask, no_outgoing_mask,
+            )
+
+        if args.time_average:
+            rho_acc += rho * args.dt
+            speed_acc += speed * args.dt
+            flow_acc += flow * args.dt
+            t_acc += args.dt
 
         if (step + 1) % args.log_interval == 0:
             log(
-                f"step={step+1}/{args.steps} mean_speed={float(np.mean(speed)):.3f} m/s "
+                f"step={step+1}/{steps} mean_speed={float(np.mean(speed)):.3f} m/s "
                 f"mean_density={float(np.mean(rho)):.6f} veh/m"
             )
 
     elapsed = time.perf_counter() - t0
-    log(f"CPU MT(lane) 시뮬레이션 완료: {elapsed:.3f}s ({args.steps} steps)")
+    log(f"CPU(lane,{model}) 시뮬레이션 완료: {elapsed:.3f}s ({steps} steps)")
+
+    if args.time_average and t_acc > 0:
+        rho = (rho_acc / t_acc).astype(np.float32)
+        speed = (speed_acc / t_acc).astype(np.float32)
+        flow = (flow_acc / t_acc).astype(np.float32)
+        log(f"시간평균 적용: T={t_acc:.1f}s 평균값으로 출력")
 
     write_outputs(args, net, rho, speed, flow)
 
@@ -252,6 +377,12 @@ def main() -> None:
     p.add_argument("--topk", type=int, default=20)
     p.add_argument("--output-csv", default="./gangnam4_cuda/results/lane_state_cpu_mt.csv")
     p.add_argument("--edge-output-csv", default="./gangnam4_cuda/results/lane_state_cpu_mt.edge.csv")
+    p.add_argument("--model", default="lwr", choices=["lwr", "ctm"],
+                   help="갱신 모델 — lwr(기본, 후방 충격파 없음) 또는 ctm(Daganzo sending/receiving, spillback)")
+    p.add_argument("--time-average", action="store_true",
+                   help="스텝별 (rho,speed,flow)을 시간 평균하여 출력(SUMO edgeData와 시간 기준 일치)")
+    p.add_argument("--sim-time", type=float, default=0.0,
+                   help="시뮬레이션 모델 시간(초). >0이면 steps를 sim_time/dt로 재계산(SUMO duration과 정렬)")
     args = p.parse_args()
     run_sim(args)
 
