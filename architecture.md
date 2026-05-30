@@ -25,7 +25,7 @@ All source lives in `gangnam4_cuda/`.
 | `gangnam4_cuda/lane_cpu_simulator_mt.py` | Lane-level CPU engine (thread pool over lanes; longitudinal + turn-demand lane-change). | `python3 lane_cpu_simulator_mt.py` |
 | `gangnam4_cuda/lane_cuda_simulator.py` | Lane-level GPU engine (CuPy, one thread per lane; same two-phase model). | `python3 lane_cuda_simulator.py` |
 | `gangnam4_cuda/run_engine.py` | **Dispatcher** — selects engine (`--engine edge\|lane`) × backend (`--backend cpu\|gpu`) and forwards remaining args to the chosen simulator. `--list` shows options, `--dry-run` prints the command. | `python3 run_engine.py --engine lane --backend cpu ...` |
-| `gangnam4_cuda/run_compare_sumo_lane.py` | **Validation harness** — runs the lane engine, aggregates lane→edge, and compares against SUMO edgedata (`--run-sumo`/`--sumo-edgedata`) or any edge-keyed CSV (`--ref-edge-csv`, for cross-engine checks). Reports Pearson r / MAE / RMSE on speed·density·flow and worst-K congestion-hotspot Jaccard overlap. | `python3 run_compare_sumo_lane.py --run-sumo ...` |
+| `gangnam4_cuda/run_compare_sumo.py` | **Engine-agnostic validation harness** — same data, swap engine via `--engine {edge,lane} --backend {cpu,gpu}`. Routes through the dispatcher, handles edge-vs-lane output schema differences, compares against SUMO edgedata (`--run-sumo`/`--sumo-edgedata`) or any edge-keyed CSV (`--ref-edge-csv`). Reports Pearson r / MAE / RMSE on speed·density·flow and worst-K congestion-hotspot Jaccard overlap. | `python3 run_compare_sumo.py --engine lane --run-sumo ...` |
 
 ## Data flow
 

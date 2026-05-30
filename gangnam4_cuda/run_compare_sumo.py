@@ -1,27 +1,36 @@
 #!/usr/bin/env python3
 """
-SUMO(미시 기준) vs 차선(lane) 엔진 검증 리포트.
+SUMO 대비 엔진 검증 하니스 — 어떤 엔진이든 같은 데이터로 비교한다.
 
-목적: 비전문가도 방어 가능한 "정량 검증"을 만든다.
- - lane 엔진을 edge 단위로 집계한 뒤, SUMO edgedata(마지막 interval)와 edge_id로 매칭
- - 속도/밀도/유량에 대해 상관계수(Pearson r), MAE, RMSE 계산
- - 혼잡 상위(worst-K) edge 집합의 일치도(Jaccard) — "혼잡 hotspot을 재현하는가"
+핵심 약속: 같은 입력(`--net-file`, `--route-file`, `--duration-sec`)에 대해
+`--engine {edge,lane} --backend {cpu,gpu}` 만 바꾸면 **동일한 검증 리포트**가
+나온다. 모든 엔진의 edge-keyed CSV 출력에서 `(edge_id, speed_mps,
+density_veh_per_m, flow_veh_per_s)` 컬럼을 읽어 동일하게 채점.
 
-SUMO를 직접 실행하거나(--run-sumo), 미리 만든 edgedata xml(--sumo-edgedata)을 쓴다.
-SUMO가 없는 환경에서는 --ref-edge-csv 로 임의의 edge 기준 CSV(예: edge 엔진 출력)와
-비교하여 하니스 자체를 검증할 수 있다(엔진 간 일관성 체크).
+리포트:
+ - 속도/밀도/유량 Pearson r, MAE, RMSE
+ - 혼잡 상위(worst-K) edge 집합의 Jaccard — "혼잡 hotspot을 재현하는가"
+
+기준(reference):
+ - `--run-sumo`           SUMO를 직접 실행
+ - `--sumo-edgedata FILE` 기존 SUMO edgedata xml 사용
+ - `--ref-edge-csv FILE`  SUMO 대신 임의의 edge 기준 CSV(엔진 간 일관성 체크용)
 
 예)
-  # 실제 검증(SUMO edgedata 보유 시)
-  python3 gangnam4_cuda/run_compare_sumo_lane.py \
+  # 실 검증(SUMO 있을 때) — lane CTM 엔진
+  python3 gangnam4_cuda/run_compare_sumo.py --run-sumo \
+      --engine lane --backend cpu \
       --net-file map_import/gangnam4_generated.net.xml \
       --route-file map_import/gangnam4_generated.gpu_compatible.rou.xml \
-      --sumo-edgedata map_import/edgedata.xml --steps 2000
+      --duration-sec 3600
+
+  # 같은 데이터, edge 엔진으로 비교
+  python3 gangnam4_cuda/run_compare_sumo.py --run-sumo \
+      --engine edge --backend cpu --net-file ... --route-file ... --duration-sec 3600
 
   # SUMO 없이 엔진 간 일관성 체크
-  python3 gangnam4_cuda/run_compare_sumo_lane.py \
-      --net-file ... --route-file ... \
-      --ref-edge-csv gangnam4_cuda/results/edge_state_cpu_mt.csv --steps 200
+  python3 gangnam4_cuda/run_compare_sumo.py --ref-edge-csv edge_state.csv \
+      --engine lane --backend cpu --net-file ... --route-file ...
 """
 
 from __future__ import annotations
@@ -74,31 +83,45 @@ def read_edge_metric_csv(path: Path) -> EdgeMetrics:
     return out
 
 
-def run_lane_engine(args, lane_edge_csv: Path) -> None:
-    """lane CPU 엔진을 실행해 edge 집계 CSV를 생성."""
-    lane_csv = lane_edge_csv.with_suffix(".lane.csv")
-    # SUMO 검증 기본: CTM 모델 + 시간평균 + SUMO와 같은 sim_time
+def run_engine_subprocess(args, edge_csv: Path) -> None:
+    """선택된 엔진(--engine/--backend)을 run_engine.py 디스패처로 실행해
+    edge_id-keyed CSV를 생성. edge 엔진은 출력 CSV 자체가 edge-CSV이고,
+    lane 엔진은 별도 --edge-output-csv 인자를 통해 edge 집계 CSV를 만든다.
+    이 함수는 어느 쪽이든 같은 `edge_csv` 경로에 결과를 남긴다.
+    """
     cmd = [
-        sys.executable,
-        str(_HERE / "lane_cpu_simulator_mt.py"),
+        sys.executable, str(_HERE / "run_engine.py"),
+        "--engine", args.engine,
+        "--backend", args.backend,
+        # 공통 인자
         "--net-file", str(args.net_file),
         "--steps", str(args.steps),
         "--dt", str(args.dt),
-        "--lane-change-rate", str(args.lane_change_rate),
         "--sim-duration", str(args.duration_sec),
-        "--model", args.model,
-        "--sim-time", str(args.engine_sim_time if args.engine_sim_time > 0 else args.duration_sec),
-        "--output-csv", str(lane_csv),
-        "--edge-output-csv", str(lane_edge_csv),
     ]
-    if args.time_average:
-        cmd.append("--time-average")
     if args.route_file:
         cmd += ["--route-file", str(args.route_file)]
+
+    if args.engine == "lane":
+        # lane 엔진: edge 집계 CSV가 비교 대상. --output-csv는 per-lane 부산물.
+        lane_csv = edge_csv.with_suffix(".lane.csv")
+        cmd += [
+            "--output-csv", str(lane_csv),
+            "--edge-output-csv", str(edge_csv),
+            "--lane-change-rate", str(args.lane_change_rate),
+            "--model", args.model,
+            "--sim-time", str(args.engine_sim_time if args.engine_sim_time > 0 else args.duration_sec),
+        ]
+        if args.time_average:
+            cmd.append("--time-average")
+    else:
+        # edge 엔진: --output-csv가 곧 edge-CSV.
+        cmd += ["--output-csv", str(edge_csv)]
+
     log("CMD: " + " ".join(cmd))
     rc = subprocess.run(cmd).returncode
     if rc != 0:
-        fail(f"lane 엔진 실행 실패(rc={rc})")
+        fail(f"엔진({args.engine}/{args.backend}) 실행 실패(rc={rc})")
 
 
 def run_sumo_edgedata(args, out_prefix: Path) -> Path:
@@ -230,8 +253,13 @@ def main() -> None:
     p.add_argument("--dt", type=float, default=0.5)
     p.add_argument("--lane-change-rate", type=float, default=0.5)
     p.add_argument("--topk", type=int, default=50, help="혼잡 hotspot 일치도 비교 edge 수")
-    p.add_argument("--out-prefix", default="./gangnam4_cuda/results/compare_lane")
-    # lane 엔진 모델 옵션(SUMO와 공정 비교를 위한 기본값)
+    p.add_argument("--out-prefix", default="./gangnam4_cuda/results/compare")
+    # 엔진 선택 — 같은 데이터로 엔진만 바꿔 비교할 수 있도록 일반화
+    p.add_argument("--engine", default="lane", choices=["edge", "lane"],
+                   help="시뮬레이션 엔진(기본 lane)")
+    p.add_argument("--backend", default="cpu", choices=["cpu", "gpu"],
+                   help="연산 백엔드(기본 cpu)")
+    # lane 엔진 전용 옵션(--engine edge에서는 무시)
     p.add_argument("--model", default="ctm", choices=["lwr", "ctm"],
                    help="lane 엔진 갱신 모델(기본 ctm: spillback 포함)")
     p.add_argument("--time-average", action="store_true", default=True,
@@ -244,23 +272,23 @@ def main() -> None:
     p.add_argument("--run-sumo", action="store_true", help="SUMO를 직접 실행해 edgedata 생성")
     p.add_argument("--sumo", default="sumo", help="SUMO 실행 바이너리")
     p.add_argument("--ref-edge-csv", default=None, help="SUMO 대신 비교할 edge 기준 CSV(엔진 간 일관성 체크)")
-    # 이미 만든 lane edge 집계 CSV 재사용(엔진 재실행 생략)
-    p.add_argument("--lane-edge-csv", default=None, help="기존 lane edge 집계 CSV 재사용")
+    # 이미 만든 엔진 출력 CSV 재사용(엔진 재실행 생략)
+    p.add_argument("--engine-edge-csv", default=None, help="기존 엔진 edge-keyed CSV 재사용")
     args = p.parse_args()
 
-    out_prefix = Path(f"{args.out_prefix}_{time.strftime('%Y%m%d_%H%M%S')}")
+    out_prefix = Path(f"{args.out_prefix}_{args.engine}_{args.backend}_{time.strftime('%Y%m%d_%H%M%S')}")
 
-    # 1) lane 엔진 결과(edge 집계) 확보
-    if args.lane_edge_csv:
-        lane_edge_csv = Path(args.lane_edge_csv)
-        if not lane_edge_csv.exists():
-            fail(f"lane-edge-csv 없음: {lane_edge_csv}")
-        log(f"기존 lane edge 집계 재사용: {lane_edge_csv}")
+    # 1) 엔진 결과(edge-keyed CSV) 확보
+    if args.engine_edge_csv:
+        engine_edge_csv = Path(args.engine_edge_csv)
+        if not engine_edge_csv.exists():
+            fail(f"engine-edge-csv 없음: {engine_edge_csv}")
+        log(f"기존 엔진 출력 재사용: {engine_edge_csv}")
     else:
-        lane_edge_csv = Path(f"{out_prefix}_lane_edge.csv")
-        run_lane_engine(args, lane_edge_csv)
-    lane_metrics = read_edge_metric_csv(lane_edge_csv)
-    log(f"lane edge 지표: {len(lane_metrics)}개 edge")
+        engine_edge_csv = Path(f"{out_prefix}_edge.csv")
+        run_engine_subprocess(args, engine_edge_csv)
+    engine_metrics = read_edge_metric_csv(engine_edge_csv)
+    log(f"엔진({args.engine}/{args.backend}) edge 지표: {len(engine_metrics)}개 edge")
 
     # 2) 기준(reference) 지표 확보
     if args.ref_edge_csv:
@@ -294,11 +322,11 @@ def main() -> None:
 
     # 3) 비교
     report_csv = Path(f"{out_prefix}_edgewise.csv")
-    res = compare(ref_metrics, lane_metrics, args.topk, report_csv)
+    res = compare(ref_metrics, engine_metrics, args.topk, report_csv)
 
     # 4) 요약 출력 + 저장
     log("=" * 56)
-    log(f"검증 리포트: 기준={ref_name}  vs  lane 엔진")
+    log(f"검증 리포트: 기준={ref_name}  vs  엔진({args.engine}/{args.backend}, model={args.model if args.engine=='lane' else 'n/a'})")
     log(f"  매칭 edge 수: {res['matched_edges']}")
     for m, s in res["metrics"].items():
         log(f"  {m:20s}  r={s['pearson_r']:.4f}  MAE={s['mae']:.4f}  RMSE={s['rmse']:.4f}")
