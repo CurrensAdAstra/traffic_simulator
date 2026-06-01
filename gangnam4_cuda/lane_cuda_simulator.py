@@ -256,6 +256,27 @@ def build_ctm_kernels(cp):
     }
     ''', "k_gather_edge_rho")
 
+    # 시간평균 누적기 — 캡처된 graph 내부에서 1 launch로 함께 동작
+    k_accumulate = cp.RawKernel(r'''
+    extern "C" __global__
+    void k_accumulate(
+        const int n, const float dt,
+        const float* __restrict__ rho,
+        const float* __restrict__ speed,
+        const float* __restrict__ flow,
+        double* __restrict__ rho_acc,
+        double* __restrict__ speed_acc,
+        double* __restrict__ flow_acc
+    ) {
+        int i = blockDim.x*blockIdx.x + threadIdx.x;
+        if (i >= n) return;
+        double d = (double)dt;
+        rho_acc[i]   += (double)rho[i]   * d;
+        speed_acc[i] += (double)speed[i] * d;
+        flow_acc[i]  += (double)flow[i]  * d;
+    }
+    ''', "k_accumulate")
+
     # Pass D: 횡방향 — 각 lane이 자기 lat 이웃의 phi 합 (lat_ptr CSR by source)
     k_gather_lat = cp.RawKernel(r'''
     extern "C" __global__
@@ -277,7 +298,7 @@ def build_ctm_kernels(cp):
     }
     ''', "k_gather_lat")
 
-    return k_gather_demand, k_gather_outflow, k_gather_edge_rho, k_gather_lat
+    return k_gather_demand, k_gather_outflow, k_gather_edge_rho, k_gather_lat, k_accumulate
 
 
 def ctm_step_gpu(cp, kernels, e_kernels, blocks, threads, blocks_e, net_g,
@@ -290,7 +311,7 @@ def ctm_step_gpu(cp, kernels, e_kernels, blocks, threads, blocks_e, net_g,
     고정 버퍼에 in-place로 기록 → CUDA Graphs 캡처도 가능한 구조.
     """
     n = rho.shape[0]
-    k_gather_demand, k_gather_outflow, k_gather_edge_rho, k_gather_lat = kernels
+    k_gather_demand, k_gather_outflow, k_gather_edge_rho, k_gather_lat, _k_acc = kernels
     fused_SR, fused_scales, fused_rho_long, fused_phi, fused_final = e_kernels
 
     rho_jam_f32 = np.float32(rho_jam)
@@ -478,7 +499,7 @@ def run_sim(args) -> None:
              np.float32(args.lane_change_rate), rho_next, speed, flow_next),
         )
 
-    # 시간평균 누적기
+    # 시간평균 누적기 (CTM에서는 graph 내부에서 누적)
     rho_acc = cp.zeros(n, dtype=cp.float64) if args.time_average else None
     speed_acc = cp.zeros(n, dtype=cp.float64) if args.time_average else None
     flow_acc = cp.zeros(n, dtype=cp.float64) if args.time_average else None
@@ -488,9 +509,31 @@ def run_sim(args) -> None:
     rho_alt = cp.empty_like(rho)
     speed_alt = cp.empty_like(speed)
     flow_alt = cp.empty_like(flow)
+    k_accumulate = ctm_kernels[4]
+    dt_f32 = np.float32(args.dt)
 
-    def ctm_one_step():
-        nonlocal rho, speed, flow, rho_alt, speed_alt, flow_alt
+    def _ctm_into(in_rho, out_rho, out_speed, out_flow):
+        """ctm step + (옵션) 누적 — capture 시점/일반 실행 모두 동일 시퀀스."""
+        ctm_step_gpu(
+            cp, ctm_kernels, ctm_e_kernels, blocks, threads, blocks_e, net_g,
+            in_rho, vmax, float(rho_jam), length_eff, float(args.dt),
+            source_demand, target_share, float(args.lane_change_rate),
+            no_incoming_mask, no_outgoing_mask, conn_split_cal, ctm_bufs,
+            out_rho, out_speed, out_flow,
+        )
+        if args.time_average:
+            k_accumulate(
+                (blocks,), (threads,),
+                (np.int32(n), dt_f32, out_rho, out_speed, out_flow,
+                 rho_acc, speed_acc, flow_acc),
+            )
+
+    # 초기 1스텝(flow/speed 정렬) — warmup은 누적기 없이 실행(CPU 동작과 일치)
+    if model == "lwr":
+        run_step_lwr()
+        rho, rho_next = rho_next, rho
+        flow, flow_next = flow_next, flow
+    else:
         ctm_step_gpu(
             cp, ctm_kernels, ctm_e_kernels, blocks, threads, blocks_e, net_g,
             rho, vmax, float(rho_jam), length_eff, float(args.dt),
@@ -502,13 +545,29 @@ def run_sim(args) -> None:
         speed, speed_alt = speed_alt, speed
         flow, flow_alt = flow_alt, flow
 
-    # 초기 1스텝(flow/speed 정렬)
-    if model == "lwr":
-        run_step_lwr()
-        rho, rho_next = rho_next, rho
-        flow, flow_next = flow_next, flow
-    else:
-        ctm_one_step()
+    # CUDA Graphs 캡처 (CTM만) — ping-pong 방향 2개를 캡처해 교대 replay
+    use_graph = False
+    graph_a_exec = None
+    graph_b_exec = None
+    capture_stream = None
+    if model == "ctm":
+        try:
+            capture_stream = cp.cuda.Stream(non_blocking=True)
+            with capture_stream:
+                capture_stream.begin_capture()
+                # graph_a: rho→rho_alt (출력은 _alt 측)
+                _ctm_into(rho, rho_alt, speed_alt, flow_alt)
+                graph_a_exec = capture_stream.end_capture()
+
+                capture_stream.begin_capture()
+                # graph_b: rho_alt→rho (출력은 원본 측)
+                _ctm_into(rho_alt, rho, speed, flow)
+                graph_b_exec = capture_stream.end_capture()
+            use_graph = True
+            log("CUDA Graphs 활성화: ping-pong 그래프 2개 캡처 완료")
+        except Exception as e:
+            log(f"CUDA Graphs 캡처 실패 — 일반 실행으로 폴백: {e}")
+            use_graph = False
 
     t0 = time.perf_counter()
     for step in range(steps):
@@ -516,23 +575,40 @@ def run_sim(args) -> None:
             run_step_lwr()
             rho, rho_next = rho_next, rho
             flow, flow_next = flow_next, flow
+        elif use_graph:
+            # 짝수 step → graph_a (rho→rho_alt → swap), 홀수 step → graph_b (rho_alt→rho)
+            if (step & 1) == 0:
+                graph_a_exec.launch()
+                # 캡처는 specific buffers를 기억 — swap도 일관되게
+                # graph_a 후: 최신 결과는 rho_alt/speed_alt/flow_alt
+            else:
+                graph_b_exec.launch(stream=capture_stream)
+                # graph_b 후: 최신 결과는 rho/speed/flow
         else:
-            ctm_one_step()
+            _ctm_into(rho, rho_alt, speed_alt, flow_alt)
+            rho, rho_alt = rho_alt, rho
+            speed, speed_alt = speed_alt, speed
+            flow, flow_alt = flow_alt, flow
 
         if args.time_average:
-            rho_acc += rho.astype(cp.float64) * args.dt
-            speed_acc += speed.astype(cp.float64) * args.dt
-            flow_acc += flow.astype(cp.float64) * args.dt
             t_acc += args.dt
 
         if (step + 1) % args.log_interval == 0:
+            # 로깅용 동기화 후 평균 계산 — graph 모드에서는 현재 결과 위치 판별
+            cur_speed = speed if (not use_graph) or ((step & 1) == 1) else speed_alt
+            cur_rho = rho if (not use_graph) or ((step & 1) == 1) else rho_alt
             log(
-                f"step={step+1}/{steps} mean_speed={float(cp.mean(speed).get()):.3f} m/s "
-                f"mean_density={float(cp.mean(rho).get()):.6f} veh/m"
+                f"step={step+1}/{steps} mean_speed={float(cp.mean(cur_speed).get()):.3f} m/s "
+                f"mean_density={float(cp.mean(cur_rho).get()):.6f} veh/m"
             )
 
     cp.cuda.runtime.deviceSynchronize()
     elapsed = time.perf_counter() - t0
+    # graph 모드에서 step 개수가 홀수면 최신 상태가 _alt 측에 있음 → swap
+    if model == "ctm" and use_graph and (steps & 1) == 1:
+        rho, rho_alt = rho_alt, rho
+        speed, speed_alt = speed_alt, speed
+        flow, flow_alt = flow_alt, flow
     log(f"CUDA(lane,{model}) 시뮬레이션 완료: {elapsed:.3f}s ({steps} steps)")
 
     if args.time_average and t_acc > 0:
