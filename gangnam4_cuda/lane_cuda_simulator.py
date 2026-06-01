@@ -148,6 +148,15 @@ def build_ctm_elementwise(cp):
         name='ctm_fused_phi',
     )
 
+    fused_jc_scale = cp.ElementwiseKernel(
+        in_params='float32 tot_jc, float32 jc_cap',
+        out_params='float32 scale_jc',
+        operation='''
+            scale_jc = fminf(1.0f, tot_jc > 0.0f ? jc_cap / fmaxf(tot_jc, 1e-12f) : 1.0f);
+        ''',
+        name='ctm_fused_jc_scale',
+    )
+
     fused_final = cp.ElementwiseKernel(
         in_params='float32 rho_long, float32 sum_phi_nb, float32 phi, float32 deg, '
                   'float32 vmax, float32 dt, float32 k_lc, float32 rho_jam',
@@ -166,7 +175,7 @@ def build_ctm_elementwise(cp):
         name='ctm_fused_final',
     )
 
-    return fused_SR, fused_scales, fused_rho_long, fused_phi, fused_final
+    return fused_SR, fused_scales, fused_rho_long, fused_phi, fused_final, fused_jc_scale
 
 
 def build_ctm_kernels(cp):
@@ -174,6 +183,47 @@ def build_ctm_kernels(cp):
 
     각 커널은 1 thread = 1 lane(또는 1 edge)으로, 자기 CSR slice만 읽음.
     """
+    # 교차로(junction)별 demand 합산 — 각 junction이 자기 conn들의 S*split 합
+    k_gather_jc_demand = cp.RawKernel(r'''
+    extern "C" __global__
+    void k_gather_jc_demand(
+        const int n_j,
+        const int* __restrict__ jc_ptr,
+        const int* __restrict__ jc_idx,
+        const float* __restrict__ S,
+        const float* __restrict__ conn_split,
+        const int* __restrict__ conn_src,
+        float* __restrict__ tot_jc
+    ) {
+        int j = blockDim.x*blockIdx.x + threadIdx.x;
+        if (j >= n_j) return;
+        int s = jc_ptr[j], e = jc_ptr[j+1];
+        float acc = 0.0f;
+        for (int kk = s; kk < e; ++kk) {
+            int ci = jc_idx[kk];
+            acc += S[conn_src[ci]] * conn_split[ci];
+        }
+        tot_jc[j] = acc;
+    }
+    ''', "k_gather_jc_demand")
+
+    # 연결별 conn_split_eff = conn_split × scale_jc[junction[k]]
+    # 이후 gather_demand/gather_outflow가 이 값을 사용해 교차로 cap을 자동 반영.
+    k_apply_jc_scale = cp.RawKernel(r'''
+    extern "C" __global__
+    void k_apply_jc_scale(
+        const int n_conn,
+        const float* __restrict__ conn_split,
+        const int* __restrict__ conn_junction,
+        const float* __restrict__ scale_jc,
+        float* __restrict__ conn_split_eff
+    ) {
+        int i = blockDim.x*blockIdx.x + threadIdx.x;
+        if (i >= n_conn) return;
+        conn_split_eff[i] = conn_split[i] * scale_jc[conn_junction[i]];
+    }
+    ''', "k_apply_jc_scale")
+
     # Pass A: 각 수신 lane이 자기 incoming 연결을 모아 tot_major/tot_minor 계산
     k_gather_demand = cp.RawKernel(r'''
     extern "C" __global__
@@ -298,21 +348,24 @@ def build_ctm_kernels(cp):
     }
     ''', "k_gather_lat")
 
-    return k_gather_demand, k_gather_outflow, k_gather_edge_rho, k_gather_lat, k_accumulate
+    return (k_gather_demand, k_gather_outflow, k_gather_edge_rho, k_gather_lat,
+            k_accumulate, k_gather_jc_demand, k_apply_jc_scale)
 
 
-def ctm_step_gpu(cp, kernels, e_kernels, blocks, threads, blocks_e, net_g,
+def ctm_step_gpu(cp, kernels, e_kernels, blocks, threads, blocks_e, blocks_j, blocks_c, net_g,
                   rho, vmax, rho_jam, length_eff, dt, source_demand, target_share, k_lc,
                   no_incoming_mask, no_outgoing_mask, conn_split, bufs,
-                  rho_next_buf, speed_next_buf, flow_next_buf):
+                  rho_next_buf, speed_next_buf, flow_next_buf,
+                  jc_cap=None):
     """GPU CTM 한 스텝 — gather RawKernel + fused ElementwiseKernel.
 
-    스텝당 커널 launch ≈ 9개(이전 ~30+). 모든 출력은 caller가 미리 할당한
+    스텝당 커널 launch ≈ 9개 (jc_cap 활성화 시 +3). 모든 출력은 caller가 미리 할당한
     고정 버퍼에 in-place로 기록 → CUDA Graphs 캡처도 가능한 구조.
     """
     n = rho.shape[0]
-    k_gather_demand, k_gather_outflow, k_gather_edge_rho, k_gather_lat, _k_acc = kernels
-    fused_SR, fused_scales, fused_rho_long, fused_phi, fused_final = e_kernels
+    (k_gather_demand, k_gather_outflow, k_gather_edge_rho, k_gather_lat,
+     _k_acc, k_gather_jc_demand, k_apply_jc_scale) = kernels
+    fused_SR, fused_scales, fused_rho_long, fused_phi, fused_final, fused_jc_scale = e_kernels
 
     rho_jam_f32 = np.float32(rho_jam)
     dt_f32 = np.float32(dt)
@@ -331,22 +384,41 @@ def ctm_step_gpu(cp, kernels, e_kernels, blocks, threads, blocks_e, net_g,
     # 1) S, R (fused)
     fused_SR(rho, vmax, rho_jam_f32, S, R)
 
+    # 1.5) 교차로(junction) cap이 활성화된 경우: junction별 demand 합산 → scale_jc →
+    #     conn_split_eff = conn_split * scale_jc[junction]. 이후 gather들이 이 값을 사용.
+    if jc_cap is not None:
+        tot_jc = bufs["tot_jc"]; scale_jc = bufs["scale_jc"]; split_eff = bufs["split_eff"]
+        k_gather_jc_demand(
+            (blocks_j,), (threads,),
+            (np.int32(net_g["n_junctions"]), net_g["jc_conn_ptr"], net_g["jc_conn_idx"],
+             S, conn_split, net_g["conn_src"], tot_jc),
+        )
+        fused_jc_scale(tot_jc, jc_cap, scale_jc)
+        k_apply_jc_scale(
+            (blocks_c,), (threads,),
+            (np.int32(net_g["n_conn"]), conn_split, net_g["conn_junction"],
+             scale_jc, split_eff),
+        )
+        conn_split_use = split_eff
+    else:
+        conn_split_use = conn_split
+
     # 2) gather demand → tot_major, tot_minor
     k_gather_demand(
         (blocks,), (threads,),
         (np.int32(n), net_g["in_conn_ptr"], net_g["in_conn_idx"],
-         S, conn_split, net_g["conn_src"], net_g["conn_priority"],
+         S, conn_split_use, net_g["conn_src"], net_g["conn_priority"],
          tot_major, tot_minor),
     )
 
     # 3) scales (fused)
     fused_scales(tot_major, tot_minor, R, scale_major, scale_minor, served_major)
 
-    # 4) gather outflow (with sink drain)
+    # 4) gather outflow (with sink drain) — junction-scaled split 사용
     k_gather_outflow(
         (blocks,), (threads,),
         (np.int32(n), net_g["out_conn_ptr"], net_g["out_conn_idx"],
-         S, conn_split, net_g["conn_dst"], net_g["conn_priority"],
+         S, conn_split_use, net_g["conn_dst"], net_g["conn_priority"],
          scale_major, scale_minor, no_outgoing_mask, outflow),
     )
 
@@ -445,6 +517,8 @@ def run_sim(args) -> None:
     # CTM 전용 디바이스 자료구조 — gather 커널이 직접 읽는 CSR 포함
     net_g = {
         "n_edges": net.n_edges,
+        "n_conn": net.n_conn,
+        "n_junctions": net.n_junctions,
         "lane_edge": lane_edge,
         "lat_ptr": lat_ptr,
         "lat_neighbors": lat_nb,
@@ -457,6 +531,9 @@ def run_sim(args) -> None:
         "out_conn_idx": cp.asarray(net.out_conn_idx),
         "edge_lane_ptr": cp.asarray(net.edge_lane_ptr),
         "edge_lanes": cp.asarray(net.edge_lanes),
+        "conn_junction": cp.asarray(net.conn_junction),
+        "jc_conn_ptr": cp.asarray(net.jc_conn_ptr),
+        "jc_conn_idx": cp.asarray(net.jc_conn_idx),
     }
     conn_split_cal = cp.asarray(conn_split_cal_np)
     out_count = cp.bincount(net_g["conn_src"], minlength=n)
@@ -471,6 +548,23 @@ def run_sim(args) -> None:
     ctm_kernels = build_ctm_kernels(cp)
     ctm_e_kernels = build_ctm_elementwise(cp)
     blocks_e = (net.n_edges + threads - 1) // threads
+    blocks_j = (net.n_junctions + threads - 1) // threads
+    blocks_c = (net.n_conn + threads - 1) // threads
+
+    # 교차로 cap: vmax-scaled q_max의 junction별 합 × cap_factor (정적, 1회 계산)
+    jc_cap_dev = None
+    if args.junction_cap_factor < 1e9 - 1:
+        q_max_lane = (net.vmax_mps * (np.float32(args.jam_density_per_lane) * 0.25)).astype(np.float32)
+        jc_cap_base = np.zeros(net.n_junctions, dtype=np.float32)
+        for j in range(net.n_junctions):
+            s = int(net.jc_outlane_ptr[j])
+            e = int(net.jc_outlane_ptr[j + 1])
+            if e > s:
+                jc_cap_base[j] = float(q_max_lane[net.jc_outlane_idx[s:e]].sum())
+        jc_cap_np = (jc_cap_base * np.float32(args.junction_cap_factor)).astype(np.float32)
+        jc_cap_dev = cp.asarray(jc_cap_np)
+        log(f"junction-cap-factor={args.junction_cap_factor} 적용 "
+            f"(mean cap={float(jc_cap_np.mean()):.4f} veh/s, junctions={net.n_junctions})")
     # CTM step에서 재사용할 버퍼들 — fused 커널의 in-place 출력 + ping-pong용
     ctm_bufs = {
         "S":           cp.empty(n, dtype=cp.float32),
@@ -486,6 +580,10 @@ def run_sim(args) -> None:
         "phi":         cp.empty(n, dtype=cp.float32),
         "sum_phi_nb":  cp.empty(n, dtype=cp.float32),
         "deg":         cp.empty(n, dtype=cp.float32),
+        # 교차로 cap용 버퍼(jc_cap이 활성화돼야 사용됨)
+        "tot_jc":      cp.empty(net.n_junctions, dtype=cp.float32),
+        "scale_jc":    cp.empty(net.n_junctions, dtype=cp.float32),
+        "split_eff":   cp.empty(net.n_conn, dtype=cp.float32),
     }
 
     def run_step_lwr() -> None:
@@ -519,11 +617,12 @@ def run_sim(args) -> None:
     def _ctm_into(in_rho, out_rho, out_speed, out_flow):
         """ctm step + (옵션) 누적 — capture 시점/일반 실행 모두 동일 시퀀스."""
         ctm_step_gpu(
-            cp, ctm_kernels, ctm_e_kernels, blocks, threads, blocks_e, net_g,
+            cp, ctm_kernels, ctm_e_kernels, blocks, threads, blocks_e, blocks_j, blocks_c, net_g,
             in_rho, vmax, float(rho_jam), length_eff, float(args.dt),
             source_demand, target_share, float(args.lane_change_rate),
             no_incoming_mask, no_outgoing_mask, conn_split_cal, ctm_bufs,
             out_rho, out_speed, out_flow,
+            jc_cap_dev,
         )
         if args.time_average:
             k_accumulate(
@@ -539,11 +638,12 @@ def run_sim(args) -> None:
         flow, flow_next = flow_next, flow
     else:
         ctm_step_gpu(
-            cp, ctm_kernels, ctm_e_kernels, blocks, threads, blocks_e, net_g,
+            cp, ctm_kernels, ctm_e_kernels, blocks, threads, blocks_e, blocks_j, blocks_c, net_g,
             rho, vmax, float(rho_jam), length_eff, float(args.dt),
             source_demand, target_share, float(args.lane_change_rate),
             no_incoming_mask, no_outgoing_mask, conn_split_cal, ctm_bufs,
             rho_alt, speed_alt, flow_alt,
+            jc_cap_dev,
         )
         rho, rho_alt = rho_alt, rho
         speed, speed_alt = speed_alt, speed
@@ -696,6 +796,8 @@ def main() -> None:
                    help="모델 시뮬레이션 시간(초). >0이면 steps를 sim_time/dt로 재계산")
     p.add_argument("--vmax-scale", type=float, default=1.0,
                    help="기본도(FD) 보정 계수 — 모든 lane의 vmax에 곱함")
+    p.add_argument("--junction-cap-factor", type=float, default=1e9,
+                   help="교차로 처리용량 계수 (기본 1e9=제약 없음, 0.5 정도가 비신호 교차로 현실값)")
     args = p.parse_args()
     run_sim(args)
 

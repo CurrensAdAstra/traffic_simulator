@@ -77,6 +77,13 @@ class LaneNet:
     in_conn_idx: np.ndarray    # [n_conn] int32, in_conn_ptr 기준 connection index
     out_conn_ptr: np.ndarray   # [n_lanes+1] int32, 송신 lane별 outgoing connection 시작/끝
     out_conn_idx: np.ndarray   # [n_conn] int32, out_conn_ptr 기준 connection index
+    # 교차로(junction) — connection의 via 속성으로 식별. 같은 junction을 통과하는 연결들은 용량 공유.
+    n_junctions: int
+    conn_junction: np.ndarray  # [n_conn] int32, 각 connection이 속한 junction
+    jc_conn_ptr: np.ndarray    # [n_junctions+1] int32, junction별 connection CSR
+    jc_conn_idx: np.ndarray    # [n_conn] int32
+    jc_outlane_ptr: np.ndarray # [n_junctions+1] int32, junction별 unique 수신 lane CSR(용량 산정용)
+    jc_outlane_idx: np.ndarray # [varies] int32
 
 
 def load_lane_net(net_file: Path) -> LaneNet:
@@ -143,7 +150,8 @@ def load_lane_net(net_file: Path) -> LaneNet:
     caps = np.zeros(n_lanes, dtype=np.int32)
     out_count = np.zeros(n_lanes, dtype=np.int32)
     raw_conns: list[tuple[int, int]] = []  # (src_lane, dst_lane)
-    raw_state: list[str] = []              # 같은 인덱스의 connection state(첫 글자)
+    raw_state: list[str] = []              # connection state(첫 글자)
+    raw_via: list[str] = []                # connection via (internal lane: ":<JUNCTION>_<idx>_<idx>")
 
     for c in root.findall("connection"):
         f = c.get("from", "")
@@ -161,6 +169,7 @@ def load_lane_net(net_file: Path) -> LaneNet:
         raw_conns.append((src, dst))
         state_str = c.get("state", "M")
         raw_state.append(state_str[:1] if state_str else "M")
+        raw_via.append(c.get("via", ""))
         out_count[src] += 1
         b = dir_to_bit(c.get("dir", ""))
         if b >= 0:
@@ -230,9 +239,49 @@ def load_lane_net(net_file: Path) -> LaneNet:
     in_conn_idx = np.argsort(conn_dst_arr, kind="stable").astype(np.int32)
     out_conn_idx = np.argsort(conn_src_arr, kind="stable").astype(np.int32)
 
+    # ---- 교차로(junction) 식별 ----
+    # SUMO connection의 via 속성: ":<JUNCTION>_<linkIdx>_<laneIdx>"
+    # 같은 junction을 통과하는 연결들은 교차로 용량을 공유한다.
+    junction_to_idx: dict[str, int] = {}
+    conn_junction_list: list[int] = []
+    NO_JUNCTION = "__none__"  # via가 없는 연결(드뭄): 별도 가짜 junction에 배치
+    for via in raw_via:
+        if via.startswith(":"):
+            rest = via[1:]
+            parts = rest.rsplit("_", 2)
+            jname = parts[0] if len(parts) >= 3 else rest
+        else:
+            jname = NO_JUNCTION
+        ji = junction_to_idx.get(jname)
+        if ji is None:
+            ji = len(junction_to_idx)
+            junction_to_idx[jname] = ji
+        conn_junction_list.append(ji)
+    n_junctions = len(junction_to_idx)
+    conn_junction = np.asarray(conn_junction_list, dtype=np.int32)
+
+    # junction별 connection CSR — gather kernel용
+    jc_count = np.bincount(conn_junction, minlength=n_junctions)
+    jc_conn_ptr = np.concatenate([[0], np.cumsum(jc_count)]).astype(np.int32)
+    jc_conn_idx = np.argsort(conn_junction, kind="stable").astype(np.int32)
+
+    # junction별 unique outgoing lane 집합 (수신측 q_max 합산으로 base 용량 계산)
+    junction_outlane_sets: list[set[int]] = [set() for _ in range(n_junctions)]
+    for k_idx, (_, dst) in enumerate(raw_conns):
+        junction_outlane_sets[conn_junction[k_idx]].add(int(dst))
+    jc_outlane_idx_list: list[int] = []
+    jc_outlane_ptr_list: list[int] = [0]
+    for s in junction_outlane_sets:
+        for lane in sorted(s):
+            jc_outlane_idx_list.append(lane)
+        jc_outlane_ptr_list.append(len(jc_outlane_idx_list))
+    jc_outlane_ptr = np.asarray(jc_outlane_ptr_list, dtype=np.int32)
+    jc_outlane_idx = np.asarray(jc_outlane_idx_list, dtype=np.int32)
+
     log(
         f"lane net 로드 완료: edges={n_edges}, lanes={n_lanes}, "
-        f"connections={len(raw_conns)}, lat_edges={len(lat_neighbors)}"
+        f"connections={len(raw_conns)}, lat_edges={len(lat_neighbors)}, "
+        f"junctions={n_junctions}"
     )
 
     return LaneNet(
@@ -262,6 +311,12 @@ def load_lane_net(net_file: Path) -> LaneNet:
         in_conn_idx=in_conn_idx,
         out_conn_ptr=out_conn_ptr,
         out_conn_idx=out_conn_idx,
+        n_junctions=n_junctions,
+        conn_junction=conn_junction,
+        jc_conn_ptr=jc_conn_ptr,
+        jc_conn_idx=jc_conn_idx,
+        jc_outlane_ptr=jc_outlane_ptr,
+        jc_outlane_idx=jc_outlane_idx,
     )
 
 

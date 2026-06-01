@@ -113,6 +113,7 @@ def ctm_step(
     no_incoming_mask: np.ndarray,
     no_outgoing_mask: np.ndarray,
     conn_split: np.ndarray,
+    jc_cap: np.ndarray | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """벡터화된 CTM(Daganzo, 1994) 한 스텝.
 
@@ -131,6 +132,17 @@ def ctm_step(
 
     # 연결별 demand (route-기반 보정된 conn_split 사용)
     D = S[net.conn_src] * conn_split
+
+    # 교차로 처리용량 제약 — 같은 junction을 통과하는 연결들이 공유하는 총 throughput cap.
+    # SUMO 미시에서 gap-acceptance·conflict로 교차로 throughput이 자동 제약되는 효과를 매크로에서 모사:
+    # junction별 D 합이 jc_cap을 넘으면 비례 축소.
+    if jc_cap is not None:
+        tot_jc = np.zeros(net.n_junctions, dtype=D.dtype)
+        np.add.at(tot_jc, net.conn_junction, D)
+        scale_jc_per_j = np.minimum(1.0,
+            np.divide(jc_cap, np.maximum(tot_jc, 1e-12),
+                      out=np.ones_like(jc_cap), where=tot_jc > 0))
+        D = D * scale_jc_per_j[net.conn_junction]
 
     # 우선권(priority/yield) 머지: major('M', 우선권)가 수신용량을 먼저 차지하고,
     # minor('m', 양보)는 남은 잔여 용량만 받는다. 양쪽 모두 scatter-add로 수신측 집계.
@@ -248,6 +260,18 @@ def run_sim(args) -> None:
     out_degree = np.bincount(net.conn_src, minlength=n)
     no_outgoing_mask = out_degree == 0
     log(f"진입 lane={int(no_incoming_mask.sum())}, 출구 lane={int(no_outgoing_mask.sum())}")
+    # 교차로 처리용량 — 각 junction의 outgoing lane들의 q_max 합 × cap factor
+    q_max_lane = net.vmax_mps * (rho_jam * 0.25)
+    jc_cap = None
+    if args.junction_cap_factor < 1e9 - 1:  # 사실상 무한이 아니면 적용
+        jc_cap_base = np.zeros(net.n_junctions, dtype=np.float32)
+        for j in range(net.n_junctions):
+            s = int(net.jc_outlane_ptr[j])
+            e = int(net.jc_outlane_ptr[j + 1])
+            if e > s:
+                jc_cap_base[j] = float(q_max_lane[net.jc_outlane_idx[s:e]].sum())
+        jc_cap = (jc_cap_base * np.float32(args.junction_cap_factor)).astype(np.float32)
+        log(f"junction-cap-factor={args.junction_cap_factor} 적용 (mean cap={float(jc_cap.mean()):.4f} veh/s)")
     # 시간평균 누적기
     rho_acc = np.zeros(n, dtype=np.float64) if args.time_average else None
     speed_acc = np.zeros(n, dtype=np.float64) if args.time_average else None
@@ -293,6 +317,7 @@ def run_sim(args) -> None:
             net, rho, net.vmax_mps, rho_jam, net.length_m, args.dt,
             source_demand, target_share, args.lane_change_rate,
             lat_src_expand, no_incoming_mask, no_outgoing_mask, conn_split_cal,
+            jc_cap,
         )
 
     t0 = time.perf_counter()
@@ -405,6 +430,8 @@ def main() -> None:
                    help="시뮬레이션 모델 시간(초). >0이면 steps를 sim_time/dt로 재계산(SUMO duration과 정렬)")
     p.add_argument("--vmax-scale", type=float, default=1.0,
                    help="기본도(FD) 보정 계수 — 모든 lane의 vmax에 곱함(미시 평균속도와 매크로 자유흐름 차이 보정용)")
+    p.add_argument("--junction-cap-factor", type=float, default=1e9,
+                   help="교차로 처리용량 계수 — 각 junction의 cap = factor × sum(q_max of outgoing lanes). 기본 1e9=사실상 무한(제약 없음). 0.5 정도가 비신호 교차로의 현실적 값.")
     args = p.parse_args()
     run_sim(args)
 
