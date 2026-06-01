@@ -94,6 +94,81 @@ def build_kernels(cp):
     return cp.RawKernel(long_code, "long_kernel"), cp.RawKernel(lat_code, "lat_kernel")
 
 
+def build_ctm_elementwise(cp):
+    """CTM 스텝의 elementwise 블록 5개를 fused ElementwiseKernel로 컴파일.
+
+    각 호출이 단일 CUDA 커널로 합쳐져, 기존 cupy `where/maximum/minimum/multiply/clip` 등
+    수십 개 launch가 5개로 줄어든다(스텝당 ~30 → ~9 kernel launch).
+    """
+    fused_SR = cp.ElementwiseKernel(
+        in_params='float32 rho, float32 vmax, float32 rho_jam',
+        out_params='float32 S, float32 R',
+        operation='''
+            float rho_c = rho_jam * 0.5f;
+            float q_max_v = vmax * rho_jam * 0.25f;
+            float q = rho * vmax * (1.0f - rho / rho_jam);
+            S = (rho <= rho_c) ? q : q_max_v;
+            R = (rho >= rho_c) ? q : q_max_v;
+        ''',
+        name='ctm_fused_SR',
+    )
+
+    fused_scales = cp.ElementwiseKernel(
+        in_params='float32 tot_major, float32 tot_minor, float32 R',
+        out_params='float32 scale_major, float32 scale_minor, float32 served_major',
+        operation='''
+            scale_major = fminf(1.0f, tot_major > 0.0f ? R / fmaxf(tot_major, 1e-12f) : 1.0f);
+            served_major = tot_major * scale_major;
+            float residual = fmaxf(R - served_major, 0.0f);
+            scale_minor = fminf(1.0f, tot_minor > 0.0f ? residual / fmaxf(tot_minor, 1e-12f) : 1.0f);
+        ''',
+        name='ctm_fused_scales',
+    )
+
+    fused_rho_long = cp.ElementwiseKernel(
+        in_params='float32 rho, float32 served_major, float32 scale_minor, float32 tot_minor, '
+                  'float32 outflow, float32 source_demand, int8 no_incoming, '
+                  'float32 length_eff, float32 dt, float32 rho_jam',
+        out_params='float32 rho_long',
+        operation='''
+            float inflow = served_major + scale_minor * tot_minor;
+            if (no_incoming) inflow += source_demand;
+            float r = rho + dt * (inflow - outflow) / length_eff;
+            if (r < 0.0f) r = 0.0f;
+            if (r > rho_jam) r = rho_jam;
+            rho_long = r;
+        ''',
+        name='ctm_fused_rho_long',
+    )
+
+    fused_phi = cp.ElementwiseKernel(
+        in_params='float32 rho_long, float32 target_share, raw float32 edge_rho, int32 lane_edge',
+        out_params='float32 phi',
+        operation='phi = rho_long - target_share * edge_rho[lane_edge];',
+        name='ctm_fused_phi',
+    )
+
+    fused_final = cp.ElementwiseKernel(
+        in_params='float32 rho_long, float32 sum_phi_nb, float32 phi, float32 deg, '
+                  'float32 vmax, float32 dt, float32 k_lc, float32 rho_jam',
+        out_params='float32 rho_next, float32 speed, float32 flow_next',
+        operation='''
+            float lat = sum_phi_nb - phi * deg;
+            float r = rho_long + dt * k_lc * lat;
+            if (r < 0.0f) r = 0.0f;
+            if (r > rho_jam) r = rho_jam;
+            float v = vmax * (1.0f - r / rho_jam);
+            if (v < 0.0f) v = 0.0f;
+            rho_next = r;
+            speed = v;
+            flow_next = r * v;
+        ''',
+        name='ctm_fused_final',
+    )
+
+    return fused_SR, fused_scales, fused_rho_long, fused_phi, fused_final
+
+
 def build_ctm_kernels(cp):
     """gather-only CTM 커널 묶음 — 모든 scatter_add(atomicAdd)를 제거.
 
@@ -205,27 +280,37 @@ def build_ctm_kernels(cp):
     return k_gather_demand, k_gather_outflow, k_gather_edge_rho, k_gather_lat
 
 
-def ctm_step_gpu(cp, kernels, blocks, threads, blocks_e, net_g, rho, vmax, rho_jam,
-                  length_eff, dt, source_demand, target_share, k_lc,
-                  no_incoming_mask, no_outgoing_mask, conn_split,
-                  bufs):
-    """GPU CTM 한 스텝 — gather-only RawKernel 기반(atomicAdd 0개).
+def ctm_step_gpu(cp, kernels, e_kernels, blocks, threads, blocks_e, net_g,
+                  rho, vmax, rho_jam, length_eff, dt, source_demand, target_share, k_lc,
+                  no_incoming_mask, no_outgoing_mask, conn_split, bufs,
+                  rho_next_buf, speed_next_buf, flow_next_buf):
+    """GPU CTM 한 스텝 — gather RawKernel + fused ElementwiseKernel.
 
-    CPU의 ctm_step과 수식 동일. 모든 누적은 1 thread per lane/edge로 자기
-    CSR slice를 직접 읽어 합산하므로 메모리 경합이 없음.
+    스텝당 커널 launch ≈ 9개(이전 ~30+). 모든 출력은 caller가 미리 할당한
+    고정 버퍼에 in-place로 기록 → CUDA Graphs 캡처도 가능한 구조.
     """
     n = rho.shape[0]
     k_gather_demand, k_gather_outflow, k_gather_edge_rho, k_gather_lat = kernels
+    fused_SR, fused_scales, fused_rho_long, fused_phi, fused_final = e_kernels
 
-    # Per-lane elementwise: S, R
-    rho_c = rho_jam * 0.5
-    q_max = vmax * (rho_jam * 0.25)
-    q = rho * vmax * (1.0 - rho / rho_jam)
-    S = cp.where(rho <= rho_c, q, q_max)
-    R = cp.where(rho >= rho_c, q, q_max)
+    rho_jam_f32 = np.float32(rho_jam)
+    dt_f32 = np.float32(dt)
+    k_lc_f32 = np.float32(k_lc)
 
-    # Pass A: gather tot_major / tot_minor
+    S = bufs["S"]; R = bufs["R"]
     tot_major = bufs["tot_major"]; tot_minor = bufs["tot_minor"]
+    scale_major = bufs["scale_major"]; scale_minor = bufs["scale_minor"]
+    served_major = bufs["served_major"]
+    outflow = bufs["outflow"]
+    rho_long = bufs["rho_long"]
+    edge_rho = bufs["edge_rho"]
+    phi = bufs["phi"]
+    sum_phi_nb = bufs["sum_phi_nb"]; deg = bufs["deg"]
+
+    # 1) S, R (fused)
+    fused_SR(rho, vmax, rho_jam_f32, S, R)
+
+    # 2) gather demand → tot_major, tot_minor
     k_gather_demand(
         (blocks,), (threads,),
         (np.int32(n), net_g["in_conn_ptr"], net_g["in_conn_idx"],
@@ -233,14 +318,10 @@ def ctm_step_gpu(cp, kernels, blocks, threads, blocks_e, net_g, rho, vmax, rho_j
          tot_major, tot_minor),
     )
 
-    # Per-lane elementwise: scales
-    scale_major = cp.minimum(1.0, cp.where(tot_major > 0, R / cp.maximum(tot_major, 1e-12), 1.0))
-    served_major = tot_major * scale_major
-    residual = cp.maximum(R - served_major, 0.0)
-    scale_minor = cp.minimum(1.0, cp.where(tot_minor > 0, residual / cp.maximum(tot_minor, 1e-12), 1.0))
+    # 3) scales (fused)
+    fused_scales(tot_major, tot_minor, R, scale_major, scale_minor, served_major)
 
-    # Pass B: gather outflow per lane (with sink drain inside kernel)
-    outflow = bufs["outflow"]
+    # 4) gather outflow (with sink drain)
     k_gather_outflow(
         (blocks,), (threads,),
         (np.int32(n), net_g["out_conn_ptr"], net_g["out_conn_idx"],
@@ -248,37 +329,36 @@ def ctm_step_gpu(cp, kernels, blocks, threads, blocks_e, net_g, rho, vmax, rho_j
          scale_major, scale_minor, no_outgoing_mask, outflow),
     )
 
-    # inflow = served_major + scale_minor*tot_minor + source(at no-incoming only)
-    inflow = served_major + scale_minor * tot_minor
-    inflow = inflow + cp.where(no_incoming_mask, source_demand, 0.0)
+    # 5) rho_long = clip(rho + dt*(inflow-outflow)/length_eff)  (fused; inflow inline)
+    fused_rho_long(
+        rho, served_major, scale_minor, tot_minor, outflow,
+        source_demand, no_incoming_mask, length_eff,
+        dt_f32, rho_jam_f32, rho_long,
+    )
 
-    # density 갱신
-    rho_long = rho + dt * (inflow - outflow) / length_eff
-    rho_long = cp.clip(rho_long, 0.0, rho_jam)
-
-    # Pass C: edge_rho gather
-    edge_rho = bufs["edge_rho"]
+    # 6) edge_rho gather
     k_gather_edge_rho(
         (blocks_e,), (threads,),
         (np.int32(net_g["n_edges"]), net_g["edge_lane_ptr"], net_g["edge_lanes"],
          rho_long, edge_rho),
     )
 
-    # phi 계산 후 Pass D: 횡방향 gather
-    phi = rho_long - target_share * edge_rho[net_g["lane_edge"]]
-    sum_phi_nb = bufs["sum_phi_nb"]; deg = bufs["deg"]
+    # 7) phi (fused, with edge_rho[lane_edge] indexing inside)
+    fused_phi(rho_long, target_share, edge_rho, net_g["lane_edge"], phi)
+
+    # 8) lateral gather → sum_phi_nb, deg
     k_gather_lat(
         (blocks,), (threads,),
         (np.int32(n), net_g["lat_ptr"], net_g["lat_neighbors"], phi,
          sum_phi_nb, deg),
     )
-    lat = sum_phi_nb - phi * deg
 
-    rho_next = rho_long + dt * k_lc * lat
-    rho_next = cp.clip(rho_next, 0.0, rho_jam)
-    speed = cp.maximum(vmax * (1.0 - rho_next / rho_jam), 0.0)
-    flow_next = rho_next * speed
-    return rho_next, speed, flow_next
+    # 9) final: lat → rho_next, speed, flow_next (fused)
+    fused_final(
+        rho_long, sum_phi_nb, phi, deg, vmax,
+        dt_f32, k_lc_f32, rho_jam_f32,
+        rho_next_buf, speed_next_buf, flow_next_buf,
+    )
 
 
 def run_sim(args) -> None:
@@ -364,15 +444,23 @@ def run_sim(args) -> None:
 
     long_kernel, lat_kernel = build_kernels(cp)
     ctm_kernels = build_ctm_kernels(cp)
+    ctm_e_kernels = build_ctm_elementwise(cp)
     blocks_e = (net.n_edges + threads - 1) // threads
-    # CTM step에서 재사용할 버퍼들(매 스텝 zeros_like 회피)
+    # CTM step에서 재사용할 버퍼들 — fused 커널의 in-place 출력 + ping-pong용
     ctm_bufs = {
-        "tot_major": cp.empty(n, dtype=cp.float32),
-        "tot_minor": cp.empty(n, dtype=cp.float32),
-        "outflow":   cp.empty(n, dtype=cp.float32),
-        "edge_rho":  cp.empty(net.n_edges, dtype=cp.float32),
-        "sum_phi_nb": cp.empty(n, dtype=cp.float32),
-        "deg":       cp.empty(n, dtype=cp.float32),
+        "S":           cp.empty(n, dtype=cp.float32),
+        "R":           cp.empty(n, dtype=cp.float32),
+        "tot_major":   cp.empty(n, dtype=cp.float32),
+        "tot_minor":   cp.empty(n, dtype=cp.float32),
+        "scale_major": cp.empty(n, dtype=cp.float32),
+        "scale_minor": cp.empty(n, dtype=cp.float32),
+        "served_major": cp.empty(n, dtype=cp.float32),
+        "outflow":     cp.empty(n, dtype=cp.float32),
+        "rho_long":    cp.empty(n, dtype=cp.float32),
+        "edge_rho":    cp.empty(net.n_edges, dtype=cp.float32),
+        "phi":         cp.empty(n, dtype=cp.float32),
+        "sum_phi_nb":  cp.empty(n, dtype=cp.float32),
+        "deg":         cp.empty(n, dtype=cp.float32),
     }
 
     def run_step_lwr() -> None:
@@ -396,18 +484,31 @@ def run_sim(args) -> None:
     flow_acc = cp.zeros(n, dtype=cp.float64) if args.time_average else None
     t_acc = 0.0
 
+    # CTM용 ping-pong 출력 버퍼 (rho/speed/flow의 alternate)
+    rho_alt = cp.empty_like(rho)
+    speed_alt = cp.empty_like(speed)
+    flow_alt = cp.empty_like(flow)
+
+    def ctm_one_step():
+        nonlocal rho, speed, flow, rho_alt, speed_alt, flow_alt
+        ctm_step_gpu(
+            cp, ctm_kernels, ctm_e_kernels, blocks, threads, blocks_e, net_g,
+            rho, vmax, float(rho_jam), length_eff, float(args.dt),
+            source_demand, target_share, float(args.lane_change_rate),
+            no_incoming_mask, no_outgoing_mask, conn_split_cal, ctm_bufs,
+            rho_alt, speed_alt, flow_alt,
+        )
+        rho, rho_alt = rho_alt, rho
+        speed, speed_alt = speed_alt, speed
+        flow, flow_alt = flow_alt, flow
+
     # 초기 1스텝(flow/speed 정렬)
     if model == "lwr":
         run_step_lwr()
         rho, rho_next = rho_next, rho
         flow, flow_next = flow_next, flow
     else:
-        rho, speed, flow = ctm_step_gpu(
-            cp, ctm_kernels, blocks, threads, blocks_e, net_g, rho, vmax,
-            float(rho_jam), length_eff, float(args.dt),
-            source_demand, target_share, float(args.lane_change_rate),
-            no_incoming_mask, no_outgoing_mask, conn_split_cal, ctm_bufs,
-        )
+        ctm_one_step()
 
     t0 = time.perf_counter()
     for step in range(steps):
@@ -416,12 +517,7 @@ def run_sim(args) -> None:
             rho, rho_next = rho_next, rho
             flow, flow_next = flow_next, flow
         else:
-            rho, speed, flow = ctm_step_gpu(
-                cp, ctm_kernels, blocks, threads, blocks_e, net_g, rho, vmax,
-                float(rho_jam), length_eff, float(args.dt),
-                source_demand, target_share, float(args.lane_change_rate),
-                no_incoming_mask, no_outgoing_mask, conn_split_cal, ctm_bufs,
-            )
+            ctm_one_step()
 
         if args.time_average:
             rho_acc += rho.astype(cp.float64) * args.dt
