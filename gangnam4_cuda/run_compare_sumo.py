@@ -111,6 +111,7 @@ def run_engine_subprocess(args, edge_csv: Path) -> None:
             "--lane-change-rate", str(args.lane_change_rate),
             "--model", args.model,
             "--sim-time", str(args.engine_sim_time if args.engine_sim_time > 0 else args.duration_sec),
+            "--vmax-scale", str(args.vmax_scale),
         ]
         if args.time_average:
             cmd.append("--time-average")
@@ -267,6 +268,8 @@ def main() -> None:
     p.add_argument("--no-time-average", action="store_false", dest="time_average")
     p.add_argument("--engine-sim-time", type=float, default=0.0,
                    help="lane 엔진의 모델 시뮬레이션 시간(초). 0이면 --duration-sec와 동일하게 정렬")
+    p.add_argument("--vmax-scale", type=float, default=1.0,
+                   help="FD 보정 — 모든 lane의 vmax에 곱함(기본 1.0 = 보정 없음)")
     # 기준(reference) 선택: 셋 중 하나
     p.add_argument("--sumo-edgedata", default=None, help="기존 SUMO edgedata xml 경로")
     p.add_argument("--run-sumo", action="store_true", help="SUMO를 직접 실행해 edgedata 생성")

@@ -392,6 +392,10 @@ def run_sim(args) -> None:
 
     net = load_lane_net(Path(args.net_file))
     n = net.n_lanes
+    # FD 보정: vmax 글로벌 스케일
+    if args.vmax_scale != 1.0:
+        net.vmax_mps = (net.vmax_mps * np.float32(args.vmax_scale)).astype(np.float32)
+        log(f"vmax-scale={args.vmax_scale} 적용 — 모든 lane의 vmax 보정")
     threads = int(args.threads_per_block)
     blocks = (n + threads - 1) // threads
     model = args.model.lower()
@@ -690,6 +694,8 @@ def main() -> None:
                    help="스텝별 (rho,speed,flow)을 시간 평균하여 출력")
     p.add_argument("--sim-time", type=float, default=0.0,
                    help="모델 시뮬레이션 시간(초). >0이면 steps를 sim_time/dt로 재계산")
+    p.add_argument("--vmax-scale", type=float, default=1.0,
+                   help="기본도(FD) 보정 계수 — 모든 lane의 vmax에 곱함")
     args = p.parse_args()
     run_sim(args)
 

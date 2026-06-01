@@ -193,6 +193,10 @@ def ctm_step(
 def run_sim(args) -> None:
     net = load_lane_net(Path(args.net_file))
     n = net.n_lanes
+    # FD 보정: vmax에 글로벌 스케일 적용(미시 평균속도와 매크로 자유흐름 차이 보정)
+    if args.vmax_scale != 1.0:
+        net.vmax_mps = (net.vmax_mps * np.float32(args.vmax_scale)).astype(np.float32)
+        log(f"vmax-scale={args.vmax_scale} 적용 — 모든 lane의 vmax 보정")
 
     workers = args.num_workers if args.num_workers > 0 else 8
     workers = max(1, workers)
@@ -399,6 +403,8 @@ def main() -> None:
                    help="스텝별 (rho,speed,flow)을 시간 평균하여 출력(SUMO edgeData와 시간 기준 일치)")
     p.add_argument("--sim-time", type=float, default=0.0,
                    help="시뮬레이션 모델 시간(초). >0이면 steps를 sim_time/dt로 재계산(SUMO duration과 정렬)")
+    p.add_argument("--vmax-scale", type=float, default=1.0,
+                   help="기본도(FD) 보정 계수 — 모든 lane의 vmax에 곱함(미시 평균속도와 매크로 자유흐름 차이 보정용)")
     args = p.parse_args()
     run_sim(args)
 
