@@ -114,6 +114,8 @@ def ctm_step(
     no_outgoing_mask: np.ndarray,
     conn_split: np.ndarray,
     jc_cap: np.ndarray | None = None,
+    flow_noise_sigma: float = 0.0,
+    rng: np.random.Generator | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """벡터화된 CTM(Daganzo, 1994) 한 스텝.
 
@@ -132,6 +134,12 @@ def ctm_step(
 
     # 연결별 demand (route-기반 보정된 conn_split 사용)
     D = S[net.conn_src] * conn_split
+
+    # 확률적 perturbation — 매크로 CTM에 stop-and-go-유사 변동 추가
+    if flow_noise_sigma > 0.0 and rng is not None:
+        noise = rng.normal(1.0, flow_noise_sigma, size=D.shape).astype(D.dtype)
+        np.clip(noise, 0.0, 2.0, out=noise)  # 안정성: 음수 demand 차단, 폭주 방지
+        D = D * noise
 
     # 교차로 처리용량 제약 — 같은 junction을 통과하는 연결들이 공유하는 총 throughput cap.
     # SUMO 미시에서 gap-acceptance·conflict로 교차로 throughput이 자동 제약되는 효과를 매크로에서 모사:
@@ -330,7 +338,7 @@ def run_sim(args) -> None:
             net, rho, net.vmax_mps, rho_jam, net.length_m, args.dt,
             source_demand, target_share, args.lane_change_rate,
             lat_src_expand, no_incoming_mask, no_outgoing_mask, conn_split_cal,
-            jc_cap,
+            jc_cap, args.flow_noise_sigma, rng,
         )
 
     t0 = time.perf_counter()
@@ -344,6 +352,7 @@ def run_sim(args) -> None:
                 net, rho, net.vmax_mps, rho_jam, net.length_m, args.dt,
                 source_demand, target_share, args.lane_change_rate,
                 lat_src_expand, no_incoming_mask, no_outgoing_mask, conn_split_cal,
+                jc_cap, args.flow_noise_sigma, rng,
             )
 
         if args.time_average:
@@ -450,6 +459,8 @@ def main() -> None:
                    help="major-priority 좌회전/U-turn 용량 계수(HCM Rank 2). 보통 ~0.7")
     p.add_argument("--minor-factor", type=float, default=1.0,
                    help="minor-priority(양보) 모든 movement 용량 계수(HCM Rank 3-4). 보통 ~0.5")
+    p.add_argument("--flow-noise-sigma", type=float, default=0.0,
+                   help="연결별 demand에 곱하는 정규분포 noise의 σ. 0=결정론, 0.1~0.5=stop-and-go-유사 변동")
     args = p.parse_args()
     run_sim(args)
 
