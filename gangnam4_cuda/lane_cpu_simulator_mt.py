@@ -237,6 +237,19 @@ def run_sim(args) -> None:
         net, Path(args.net_file), Path(args.route_file) if args.route_file else None,
         args.sim_duration, args.source_demand,
     )
+    # HCM-style per-movement capacity penalty — 사전 계산해 conn_split_cal에 합성
+    if args.major_left_factor != 1.0 or args.minor_factor != 1.0:
+        mvf = np.ones(net.n_conn, dtype=np.float32)
+        from lane_common import DIR_L, DIR_T  # 좌회전·U-turn 인덱스
+        pri_b = net.conn_priority.astype(bool)
+        is_left_or_u = (net.conn_dir == DIR_L) | (net.conn_dir == DIR_T)
+        # major + (좌회전/U-turn) → major_left_factor
+        mvf[pri_b & is_left_or_u] = float(args.major_left_factor)
+        # minor (모든 방향) → minor_factor
+        mvf[~pri_b] = float(args.minor_factor)
+        conn_split_cal = (conn_split_cal * mvf).astype(np.float32)
+        log(f"HCM movement penalty 적용: major-left={args.major_left_factor}, "
+            f"minor={args.minor_factor}, 영향 연결={int((mvf != 1.0).sum())}/{net.n_conn}")
     # --sim-time이 주어지면 steps를 sim_time/dt로 재계산
     steps = args.steps
     if args.sim_time and args.sim_time > 0:
@@ -432,6 +445,11 @@ def main() -> None:
                    help="기본도(FD) 보정 계수 — 모든 lane의 vmax에 곱함(미시 평균속도와 매크로 자유흐름 차이 보정용)")
     p.add_argument("--junction-cap-factor", type=float, default=1e9,
                    help="교차로 처리용량 계수 — 각 junction의 cap = factor × sum(q_max of outgoing lanes). 기본 1e9=사실상 무한(제약 없음). 0.5 정도가 비신호 교차로의 현실적 값.")
+    # HCM-style per-movement capacity penalties (default 1.0 = no penalty)
+    p.add_argument("--major-left-factor", type=float, default=1.0,
+                   help="major-priority 좌회전/U-turn 용량 계수(HCM Rank 2). 보통 ~0.7")
+    p.add_argument("--minor-factor", type=float, default=1.0,
+                   help="minor-priority(양보) 모든 movement 용량 계수(HCM Rank 3-4). 보통 ~0.5")
     args = p.parse_args()
     run_sim(args)
 

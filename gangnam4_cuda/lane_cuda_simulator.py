@@ -489,6 +489,17 @@ def run_sim(args) -> None:
         args.sim_duration, args.source_demand,
     )
     log(f"수요/목표분배 준비 완료: vehicles={veh_n}, lane-change-rate={args.lane_change_rate}")
+    # HCM-style per-movement capacity penalty — 사전 계산해 conn_split_cal_np에 합성
+    if args.major_left_factor != 1.0 or args.minor_factor != 1.0:
+        from lane_common import DIR_L, DIR_T
+        mvf = np.ones(net.n_conn, dtype=np.float32)
+        pri_b = net.conn_priority.astype(bool)
+        is_left_or_u = (net.conn_dir == DIR_L) | (net.conn_dir == DIR_T)
+        mvf[pri_b & is_left_or_u] = float(args.major_left_factor)
+        mvf[~pri_b] = float(args.minor_factor)
+        conn_split_cal_np = (conn_split_cal_np * mvf).astype(np.float32)
+        log(f"HCM movement penalty: major-left={args.major_left_factor}, "
+            f"minor={args.minor_factor}, 영향 연결={int((mvf != 1.0).sum())}/{net.n_conn}")
 
     rng = np.random.default_rng(args.seed)
     rho0 = (args.init_density * rng.uniform(0.7, 1.3, size=n)).astype(np.float32)
@@ -798,6 +809,10 @@ def main() -> None:
                    help="기본도(FD) 보정 계수 — 모든 lane의 vmax에 곱함")
     p.add_argument("--junction-cap-factor", type=float, default=1e9,
                    help="교차로 처리용량 계수 (기본 1e9=제약 없음, 0.5 정도가 비신호 교차로 현실값)")
+    p.add_argument("--major-left-factor", type=float, default=1.0,
+                   help="major-priority 좌회전/U-turn 용량 계수(HCM Rank 2). 보통 ~0.7")
+    p.add_argument("--minor-factor", type=float, default=1.0,
+                   help="minor-priority(양보) 모든 movement 용량 계수(HCM Rank 3-4). 보통 ~0.5")
     args = p.parse_args()
     run_sim(args)
 

@@ -72,6 +72,7 @@ class LaneNet:
     conn_dst: np.ndarray       # [n_conn] int32, 수신 lane
     conn_split: np.ndarray     # [n_conn] float32, 송신 측 분배 비율(1/outdeg)
     conn_priority: np.ndarray  # [n_conn] int8, 1=major('M'/대문자/'='), 0=minor('m')
+    conn_dir: np.ndarray       # [n_conn] int8, DIR_L/S/R/T (0/1/2/3) — HCM movement penalty용
     # 연결의 수신/송신 측 CSR — gather-only GPU 커널용(atomicAdd 제거)
     in_conn_ptr: np.ndarray    # [n_lanes+1] int32, 수신 lane별 incoming connection 시작/끝
     in_conn_idx: np.ndarray    # [n_conn] int32, in_conn_ptr 기준 connection index
@@ -152,6 +153,7 @@ def load_lane_net(net_file: Path) -> LaneNet:
     raw_conns: list[tuple[int, int]] = []  # (src_lane, dst_lane)
     raw_state: list[str] = []              # connection state(첫 글자)
     raw_via: list[str] = []                # connection via (internal lane: ":<JUNCTION>_<idx>_<idx>")
+    raw_dir: list[int] = []                # connection dir 코드 (DIR_L/S/R/T) — HCM 방식 movement penalty용
 
     for c in root.findall("connection"):
         f = c.get("from", "")
@@ -172,6 +174,7 @@ def load_lane_net(net_file: Path) -> LaneNet:
         raw_via.append(c.get("via", ""))
         out_count[src] += 1
         b = dir_to_bit(c.get("dir", ""))
+        raw_dir.append(b if b >= 0 else DIR_S)  # 알 수 없으면 straight로 폴백
         if b >= 0:
             caps[src] |= (1 << b)
 
@@ -307,6 +310,7 @@ def load_lane_net(net_file: Path) -> LaneNet:
         conn_dst=conn_dst_arr,
         conn_split=np.asarray(conn_split_list, dtype=np.float32),
         conn_priority=np.asarray(conn_priority_list, dtype=np.int8),
+        conn_dir=np.asarray(raw_dir, dtype=np.int8),
         in_conn_ptr=in_conn_ptr,
         in_conn_idx=in_conn_idx,
         out_conn_ptr=out_conn_ptr,
