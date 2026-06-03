@@ -3,14 +3,22 @@
 ## Overview
 
 This project is a SUMO-independent traffic simulator for the Gangnam-4-district
-road network. It models each road **edge** as an independent parallel unit and
-time-steps an LWR-style density/speed/flow model. Two interchangeable engines
-implement the same model — one on the **GPU** (CuPy `RawKernel`, one CUDA thread
-per edge) and one on the **CPU** (`ThreadPoolExecutor` over edge chunks). Two
-harness scripts run the engines alongside **SUMO** to validate accuracy and
-benchmark performance.
+road network, evolved through three engine families of increasing fidelity, all
+validated against SUMO and all in `gangnam4_cuda/`:
 
-All source lives in `gangnam4_cuda/`.
+1. **Edge macro** (gen-1) — one LWR density cell per road *edge*. CPU + GPU.
+2. **Lane macro / CTM** (gen-2) — one cell per *lane*, Daganzo Cell-Transmission
+   Model with sending/receiving flux, priority/yield merge, route-derived turn
+   split, per-movement (HCM) capacity, and a global free-flow calibration
+   (`--vmax-scale`). CPU + GPU. The GPU path is fully gather-based (no
+   atomics), fused into ~9 kernels, and CUDA-Graph-captured → **0.09 s for a
+   1-hour, 100k-vehicle sim on an RTX 3090** (~24,000× faster than SUMO).
+3. **Mesoscopic** (gen-3) — individual *vehicles* routed edge-to-edge via a
+   time-stepped spatial-queue model. Produces per-vehicle travel times (a
+   validation axis the macro engines can't reach) and wins decisively on
+   flow/speed/density correlation vs SUMO.
+
+See **Engine families & validation** below for the accuracy/speed comparison.
 
 ## Components
 
@@ -26,6 +34,9 @@ All source lives in `gangnam4_cuda/`.
 | `gangnam4_cuda/lane_cuda_simulator.py` | Lane-level GPU engine (CuPy, one thread per lane; same two-phase model). | `python3 lane_cuda_simulator.py` |
 | `gangnam4_cuda/run_engine.py` | **Dispatcher** — selects engine (`--engine edge\|lane`) × backend (`--backend cpu\|gpu`) and forwards remaining args to the chosen simulator. `--list` shows options, `--dry-run` prints the command. | `python3 run_engine.py --engine lane --backend cpu ...` |
 | `gangnam4_cuda/run_compare_sumo.py` | **Engine-agnostic validation harness** — same data, swap engine via `--engine {edge,lane} --backend {cpu,gpu}`. Routes through the dispatcher, handles edge-vs-lane output schema differences, compares against SUMO edgedata (`--run-sumo`/`--sumo-edgedata`) or any edge-keyed CSV (`--ref-edge-csv`). Reports Pearson r / MAE / RMSE on speed·density·flow and worst-K congestion-hotspot Jaccard overlap. | `python3 run_compare_sumo.py --engine lane --run-sumo ...` |
+| `gangnam4_cuda/cell_common.py`, `cell_cpu_simulator.py` | **Multi-cell CTM** — subdivides each lane into ~15 m cells. Experiment; no accuracy gain for time-averaged metrics (kept for time-resolved/packet follow-ups). | `python3 cell_cpu_simulator.py` |
+| `gangnam4_cuda/meso_common.py`, `meso_sim.py` | **Mesoscopic engine** — vehicle loader + time-stepped spatial-queue simulator. Outputs per-vehicle travel times + edge density/speed/measured-throughput. | `python3 meso_sim.py --vmax-scale 0.5` |
+| `gangnam4_cuda/compare_tripinfo.py` | Per-vehicle travel-time comparison: SUMO `tripinfo` vs meso trip CSV (matched by vehicle id; Pearson r / MAE / bias). | `python3 compare_tripinfo.py --sumo-tripinfo ... --meso-trips ...` |
 
 ## Data flow
 
@@ -177,12 +188,38 @@ Defaults point at the generated net/route (`gangnam4_generated.net.xml` +
 whose routes match the network — unlike the synthetic 2-lane fallback net, which
 has no matching routes.
 
+## Engine families & validation
+
+All numbers below are vs SUMO on the generated net (8,469 edges / 17,810 lanes),
+100k vehicles, 3,600 s, sorted routes; edge metrics over the 6,499 edges SUMO
+actually observed. Calibration knobs: `--vmax-scale` (global free-flow factor;
+data-driven ≈0.35), `--major-left-factor`/`--minor-factor` (HCM movement
+capacity), both default 1.0 (off).
+
+| Engine (config) | speed r | density r | flow r | hotspot top-100 | 1-h wall |
+| --- | --- | --- | --- | --- | --- |
+| edge macro LWR | 0.01 | 0.10 | 0.27 | 4/100 | ~70 s (CPU) |
+| lane CTM (no calib) | 0.06 | 0.26 | 0.66 | 1/100 | 0.09 s (GPU) |
+| lane CTM + vmax 0.35 | 0.16 | 0.28 | 0.70 | 14/100 | 0.09 s (GPU) |
+| lane CTM + vmax 0.35 + HCM 0.7/0.5 | **0.22** | 0.35 | 0.69 | **15/100** | 0.09 s (GPU) |
+| **meso (vmax 0.5)** | **0.37** | **0.42** | **0.84** | 7/100 | ~24 s (CPU) |
+
+Takeaways: the lane-CTM GPU path is the **speed champion** (sub-0.1 s) and best
+at *ranking* the worst congestion edges. The **mesoscopic engine** is the
+**accuracy champion** on flow/speed/density because its queue dynamics track
+real congestion, and it uniquely yields per-vehicle travel times
+(`compare_tripinfo.py`). Negative results (documented in git history): aggregate
+junction capacity, multi-cell spatial refinement, and stochastic flow noise did
+not improve the time-averaged metrics.
+
 ## Runtime / deployment
 
 - **Docker image** (`gangnam4_cuda/Dockerfile`): base
-  `nvidia/cuda:12.3.2-devel-ubuntu22.04`; installs `python3`, `sumo`,
-  `sumo-tools`, `numpy`, `cupy-cuda12x`; `WORKDIR /workspace`. Tagged
-  `gangnam4-cuda-sumo:latest` to match the compare script default.
+  `nvidia/cuda:12.3.2-devel-ubuntu22.04`; installs `python3`, then **SUMO 1.27
+  from `ppa:sumo/stable`** (Ubuntu's apt 1.12 is too old for the net's vClasses),
+  `numpy`, `cupy-cuda12x`; sets `SUMO_HOME`. Tagged `gangnam4-cuda-sumo:latest`.
+  Run GPU engines with `docker run --gpus all` (verified on RTX 3090, CUDA 13
+  driver / cupy 14).
 - **GPU backend autodetect** (benchmark script): tries `cupy` first, falls back
   to `torch`, else CPU-only. `--require-cuda` fails fast if no GPU backend.
 - **Key CLI defaults** (engines): `--steps 2000`, `--dt 0.5`,
