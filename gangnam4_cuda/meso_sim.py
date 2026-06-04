@@ -62,7 +62,7 @@ def run_sim(args) -> None:
     state = np.zeros(V, dtype=np.int8)
     cur_pos = np.full(V, -1, dtype=np.int32)       # route 내 현재 위치
     cur_edge = np.full(V, -1, dtype=np.int32)
-    exit_time = np.full(V, np.inf, dtype=np.float64)
+    pos_m = np.zeros(V, dtype=np.float64)          # 현재 edge 진입 후 진행 거리(m). length 도달 시 queue
     enter_time = np.zeros(V, dtype=np.float64)     # 현재 edge 진입 시각(FIFO)
     start_time = np.full(V, -1.0, dtype=np.float64) # 네트워크 최초 진입
     arrival_time = np.full(V, -1.0, dtype=np.float64)
@@ -87,11 +87,11 @@ def run_sim(args) -> None:
 
     min_speed = float(args.min_speed)
 
-    def edge_speed(e_idx):
-        """현재 밀도 기반 Greenshields 속도. min_speed로 하한(0이면 거의 정지 허용)."""
-        dens = edge_count[e_idx] / np.maximum(length[e_idx] * lanes[e_idx], 1.0)
-        v = vmax[e_idx] * (1.0 - dens / rho_jam)
-        return np.maximum(v, min_speed)  # 낮을수록 jam에서 더 오래 정체(SUMO에 근접)
+    def edge_speed_all() -> np.ndarray:
+        """모든 edge의 현재 밀도 기반 Greenshields 속도(>= min_speed). [E]"""
+        dens = edge_count / np.maximum(length * lanes, 1.0)
+        v = vmax * (1.0 - dens / rho_jam)
+        return np.maximum(v, min_speed)
 
     dep_ptr = 0  # veh_depart 정렬 포인터
     t0 = time.perf_counter()
@@ -99,9 +99,17 @@ def run_sim(args) -> None:
     for step in range(n_steps):
         t = step * dt
 
-        # 1) running → queued (하류 끝 도달)
-        run_reached = (state == STATE_RUN) & (exit_time <= t)
-        state[run_reached] = STATE_QUEUE
+        # 0) 현재 밀도 기반 edge 속도(이번 스텝 동안 고정)
+        espeed = edge_speed_all()
+
+        # 1) running 차량 위치 전진 (현재 edge 밀도 속도로). length 도달 → queued.
+        #    이렇게 하면 진입 후 edge가 막히면 차량도 함께 느려짐(stop-and-go).
+        run_mask = state == STATE_RUN
+        if run_mask.any():
+            rv = np.flatnonzero(run_mask)
+            pos_m[rv] += espeed[cur_edge[rv]] * dt
+            reached = rv[pos_m[rv] >= length[cur_edge[rv]]]
+            state[reached] = STATE_QUEUE
 
         # 2) 유출 capacity 누적
         out_credit += sat_cap * dt
@@ -161,10 +169,9 @@ def run_sim(args) -> None:
                     cur_pos[mv] += 1
                     cur_edge[mv] = mv_ne.astype(np.int32)
                     enter_time[mv] = t
+                    pos_m[mv] = 0.0
                     np.add.at(edge_count, mv_ne, 1)
                     state[mv] = STATE_RUN
-                    spd = edge_speed(mv_ne)
-                    exit_time[mv] = t + length[mv_ne] / spd
 
         # 4) Departures: depart<=t 인 PRE 차량을 첫 edge에 투입(잔여 space 한도)
         while dep_ptr < V and net.veh_depart[dep_ptr] <= t:
@@ -185,9 +192,8 @@ def run_sim(args) -> None:
                 cur_edge[ins] = ie.astype(np.int32)
                 enter_time[ins] = t
                 start_time[ins] = t
+                pos_m[ins] = 0.0
                 np.add.at(edge_count, ie, 1)
-                spd = edge_speed(ie)
-                exit_time[ins] = t + length[ie] / spd
 
         # 5) edge 시간평균 누적
         acc_count += edge_count * dt
