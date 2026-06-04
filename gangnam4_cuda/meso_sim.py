@@ -64,6 +64,7 @@ def run_sim(args) -> None:
     cur_edge = np.full(V, -1, dtype=np.int32)
     pos_m = np.zeros(V, dtype=np.float64)          # 현재 edge 진입 후 진행 거리(m). length 도달 시 queue
     enter_time = np.zeros(V, dtype=np.float64)     # 현재 edge 진입 시각(FIFO)
+    hold_until = np.zeros(V, dtype=np.float64)     # 교차로 진입 지연: 이 시각까지 전진 보류
     start_time = np.full(V, -1.0, dtype=np.float64) # 네트워크 최초 진입
     arrival_time = np.full(V, -1.0, dtype=np.float64)
     route_dist = np.zeros(V, dtype=np.float64)     # 통과 거리 누적(평균속도용)
@@ -86,6 +87,7 @@ def run_sim(args) -> None:
     redges = net.route_edges
 
     min_speed = float(args.min_speed)
+    jct_delay = float(args.junction_delay)
 
     def edge_speed_all() -> np.ndarray:
         """모든 edge의 현재 밀도 기반 Greenshields 속도(>= min_speed). [E]"""
@@ -107,8 +109,10 @@ def run_sim(args) -> None:
         run_mask = state == STATE_RUN
         if run_mask.any():
             rv = np.flatnonzero(run_mask)
-            pos_m[rv] += espeed[cur_edge[rv]] * dt
-            reached = rv[pos_m[rv] >= length[cur_edge[rv]]]
+            # 교차로 진입 지연(hold_until) 경과한 차량만 전진
+            active = rv[hold_until[rv] <= t]
+            pos_m[active] += espeed[cur_edge[active]] * dt
+            reached = active[pos_m[active] >= length[cur_edge[active]]]
             state[reached] = STATE_QUEUE
 
         # 2) 유출 capacity 누적
@@ -170,6 +174,7 @@ def run_sim(args) -> None:
                     cur_edge[mv] = mv_ne.astype(np.int32)
                     enter_time[mv] = t
                     pos_m[mv] = 0.0
+                    hold_until[mv] = t + jct_delay   # 교차로 통과 지연
                     np.add.at(edge_count, mv_ne, 1)
                     state[mv] = STATE_RUN
 
@@ -256,6 +261,8 @@ def main() -> None:
     p.add_argument("--vmax-scale", type=float, default=1.0)
     p.add_argument("--min-speed", type=float, default=0.3,
                    help="혼잡 edge 최소 통과속도(m/s). 낮을수록 jam에서 더 오래 정체→SUMO 통행시간에 근접. 0.3=기본")
+    p.add_argument("--junction-delay", type=float, default=0.0,
+                   help="edge 전이(교차로 통과)마다 추가되는 고정 지연(s). 신호/양보 대기 근사. ~10s가 현실적")
     p.add_argument("--max-vehicles", type=int, default=0, help=">0이면 출발순 앞쪽 N대만(테스트)")
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--log-interval", type=int, default=600)
