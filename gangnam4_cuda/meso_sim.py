@@ -85,11 +85,13 @@ def run_sim(args) -> None:
     veh_len = net.veh_route_len
     redges = net.route_edges
 
+    min_speed = float(args.min_speed)
+
     def edge_speed(e_idx):
-        """현재 밀도 기반 Greenshields 속도(>=0.1)."""
+        """현재 밀도 기반 Greenshields 속도. min_speed로 하한(0이면 거의 정지 허용)."""
         dens = edge_count[e_idx] / np.maximum(length[e_idx] * lanes[e_idx], 1.0)
         v = vmax[e_idx] * (1.0 - dens / rho_jam)
-        return np.maximum(v, 0.3)  # 최소 속도(정지 방지, 통과시간 유한 보장)
+        return np.maximum(v, min_speed)  # 낮을수록 jam에서 더 오래 정체(SUMO에 근접)
 
     dep_ptr = 0  # veh_depart 정렬 포인터
     t0 = time.perf_counter()
@@ -246,6 +248,8 @@ def main() -> None:
     p.add_argument("--jam-density-per-lane", type=float, default=0.18)
     p.add_argument("--sat-flow-per-lane", type=float, default=0.5, help="차로당 saturation flow(veh/s), ~1800veh/h")
     p.add_argument("--vmax-scale", type=float, default=1.0)
+    p.add_argument("--min-speed", type=float, default=0.3,
+                   help="혼잡 edge 최소 통과속도(m/s). 낮을수록 jam에서 더 오래 정체→SUMO 통행시간에 근접. 0.3=기본")
     p.add_argument("--max-vehicles", type=int, default=0, help=">0이면 출발순 앞쪽 N대만(테스트)")
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--log-interval", type=int, default=600)
