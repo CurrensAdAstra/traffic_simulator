@@ -13,9 +13,14 @@ from __future__ import annotations
 
 import argparse
 import csv
-import math
+import sys
 import xml.etree.ElementTree as ET
 from pathlib import Path
+
+import numpy as np
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import metrics as M  # 표준 메트릭 공유
 
 
 def log(m): print(f"[LOG] {m}")
@@ -46,29 +51,10 @@ def load_meso_trips(path: Path) -> dict[str, float]:
     return out
 
 
-def stats(xs):
-    import statistics as st
-    n = len(xs)
-    if n == 0:
-        return (0, 0, 0, 0)
-    s = sorted(xs)
-    mean = sum(xs) / n
-    median = s[n // 2]
-    p95 = s[min(n - 1, int(0.95 * n))]
-    return (n, mean, median, p95)
-
-
-def pearson(a, b):
-    n = len(a)
-    if n < 2:
-        return float("nan")
-    ma, mb = sum(a) / n, sum(b) / n
-    sab = sum((x - ma) * (y - mb) for x, y in zip(a, b))
-    saa = sum((x - ma) ** 2 for x in a)
-    sbb = sum((y - mb) ** 2 for y in b)
-    if saa <= 0 or sbb <= 0:
-        return float("nan")
-    return sab / math.sqrt(saa * sbb)
+def dist_stats(xs: np.ndarray):
+    if xs.size == 0:
+        return (0, 0.0, 0.0, 0.0)
+    return (int(xs.size), float(xs.mean()), float(np.median(xs)), float(np.percentile(xs, 95)))
 
 
 def main():
@@ -81,27 +67,30 @@ def main():
     sumo = load_sumo_tripinfo(Path(args.sumo_tripinfo))
     meso = load_meso_trips(Path(args.meso_trips))
     log(f"SUMO 완주={len(sumo)}, meso 완주={len(meso)}, total={args.total_vehicles}")
-    log(f"완주율: SUMO={100*len(sumo)/args.total_vehicles:.1f}%  meso={100*len(meso)/args.total_vehicles:.1f}%")
+    s_rate = 100 * len(sumo) / args.total_vehicles
+    m_rate = 100 * len(meso) / args.total_vehicles
+    log(f"완주율: SUMO={s_rate:.1f}%  meso={m_rate:.1f}%  (차이 {abs(s_rate-m_rate):.1f}%p)")
 
-    sn, smean, smed, sp95 = stats(list(sumo.values()))
-    mn, mmean, mmed, mp95 = stats(list(meso.values()))
+    sa_all = np.array(list(sumo.values()), float)
+    ma_all = np.array(list(meso.values()), float)
+    sn, smean, smed, sp95 = dist_stats(sa_all)
+    mn, mmean, mmed, mp95 = dist_stats(ma_all)
     log(f"SUMO 통행시간: mean={smean:.1f}s median={smed:.1f}s p95={sp95:.1f}s (n={sn})")
     log(f"meso 통행시간: mean={mmean:.1f}s median={mmed:.1f}s p95={mp95:.1f}s (n={mn})")
+    # 분포(완주 차량 전체) KS — id 매칭 없이 분포 형태 비교
+    log(f"통행시간 분포 KS(전체) = {M.ks_statistic(sa_all, ma_all):.4f}")
 
     common = sorted(set(sumo) & set(meso))
     log(f"공통 완주 차량(id 매칭)={len(common)}")
     if common:
-        sa = [sumo[v] for v in common]
-        mb = [meso[v] for v in common]
-        r = pearson(sa, mb)
-        n = len(common)
-        mae = sum(abs(x - y) for x, y in zip(sa, mb)) / n
-        rmse = math.sqrt(sum((x - y) ** 2 for x, y in zip(sa, mb)) / n)
-        bias = sum(y - x for x, y in zip(sa, mb)) / n  # meso - sumo
-        log("=" * 52)
-        log(f"차량별 통행시간 일치: Pearson r={r:.4f}  MAE={mae:.1f}s  RMSE={rmse:.1f}s")
-        log(f"  bias(meso-SUMO) 평균={bias:+.1f}s")
-        log("=" * 52)
+        sa = np.array([sumo[v] for v in common], float)
+        mb = np.array([meso[v] for v in common], float)
+        log("=" * 60)
+        log(f"차량별 통행시간 일치(n={len(common)}):")
+        log(f"  Pearson r={M.pearson_r(sa, mb):.4f}  Spearman rho={M.spearman_rho(sa, mb):.4f}")
+        log(f"  MAPE={M.mape(sa, mb):.1f}%  bias(meso-SUMO)={M.bias(sa, mb):+.1f}s")
+        log(f"  RMSN={M.rmsn(sa, mb):.4f}  KS(matched)={M.ks_statistic(sa, mb):.4f}")
+        log("=" * 60)
 
 
 if __name__ == "__main__":

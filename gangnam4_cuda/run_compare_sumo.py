@@ -175,28 +175,8 @@ def run_sumo_edgedata(args, out_prefix: Path) -> Path:
     return edgedata
 
 
-def _pearson(xs: list[float], ys: list[float]) -> float:
-    n = len(xs)
-    if n < 2:
-        return float("nan")
-    mx = sum(xs) / n
-    my = sum(ys) / n
-    sxy = sum((x - mx) * (y - my) for x, y in zip(xs, ys))
-    sxx = sum((x - mx) ** 2 for x in xs)
-    syy = sum((y - my) ** 2 for y in ys)
-    if sxx <= 0 or syy <= 0:
-        return float("nan")
-    return sxy / math.sqrt(sxx * syy)
-
-
-def _err_stats(ref: list[float], test: list[float]) -> tuple[float, float, float]:
-    """(Pearson r, MAE, RMSE)."""
-    n = len(ref)
-    if n == 0:
-        return float("nan"), float("nan"), float("nan")
-    mae = sum(abs(a - b) for a, b in zip(ref, test)) / n
-    rmse = math.sqrt(sum((a - b) ** 2 for a, b in zip(ref, test)) / n)
-    return _pearson(ref, test), mae, rmse
+import numpy as _np
+import metrics as _M  # 표준 교통 메트릭(GEH/RMSN/Spearman/KS/precision-recall)
 
 
 def compare(ref: EdgeMetrics, test: EdgeMetrics, topk: int, report_csv: Path) -> dict:
@@ -204,20 +184,31 @@ def compare(ref: EdgeMetrics, test: EdgeMetrics, topk: int, report_csv: Path) ->
     if not edges:
         fail("매칭되는 edge가 0개 — net/route/edge_id 정합성 확인 필요")
 
-    metrics = ["speed_mps", "density_veh_per_m", "flow_veh_per_s"]
+    metrics_keys = ["speed_mps", "density_veh_per_m", "flow_veh_per_s"]
     summary: dict[str, dict[str, float]] = {}
-    for m in metrics:
-        r_vals = [ref[e][m] for e in edges]
-        t_vals = [test[e][m] for e in edges]
-        r, mae, rmse = _err_stats(r_vals, t_vals)
-        summary[m] = {"pearson_r": r, "mae": mae, "rmse": rmse}
+    arrs: dict[str, tuple] = {}
+    for m in metrics_keys:
+        r_vals = _np.array([ref[e][m] for e in edges], float)
+        t_vals = _np.array([test[e][m] for e in edges], float)
+        arrs[m] = (r_vals, t_vals)
+        summary[m] = {
+            "pearson_r": _M.pearson_r(r_vals, t_vals),
+            "spearman_rho": _M.spearman_rho(r_vals, t_vals),
+            "rmsn": _M.rmsn(r_vals, t_vals),
+            "mae": float(_np.mean(_np.abs(t_vals - r_vals))),
+            "rmse": float(_np.sqrt(_np.mean((t_vals - r_vals) ** 2))),
+        }
 
-    # 혼잡 hotspot 일치도: 속도 하위 K edge 집합의 Jaccard
+    # flow GEH (교통 표준): veh/s → veh/h 환산 후 GEH<5 비율
+    rf, tf = arrs["flow_veh_per_s"]
+    summary["flow_veh_per_s"]["geh_lt5_frac"] = _M.geh_fraction(tf * 3600.0, rf * 3600.0, 5.0)
+
+    # 혼잡 hotspot: 속도 하위 K — Jaccard(하위호환) + precision/recall@K + Spearman(전체)
     k = min(topk, len(edges))
-    ref_worst = set(sorted(edges, key=lambda e: ref[e]["speed_mps"])[:k])
-    test_worst = set(sorted(edges, key=lambda e: test[e]["speed_mps"])[:k])
-    inter = len(ref_worst & test_worst)
-    union = len(ref_worst | test_worst)
+    rs, ts = arrs["speed_mps"]
+    prec, rec = _M.precision_recall_at_k(rs, ts, k, lowest=True)
+    ref_worst = set(_np.argsort(rs)[:k]); test_worst = set(_np.argsort(ts)[:k])
+    inter = len(ref_worst & test_worst); union = len(ref_worst | test_worst)
     jaccard = inter / union if union else float("nan")
 
     # edgewise 리포트 저장
@@ -245,6 +236,8 @@ def compare(ref: EdgeMetrics, test: EdgeMetrics, topk: int, report_csv: Path) ->
         "hotspot_topk": k,
         "hotspot_jaccard": jaccard,
         "hotspot_overlap": f"{inter}/{k}",
+        "hotspot_precision": prec,
+        "hotspot_recall": rec,
     }
 
 
@@ -337,23 +330,31 @@ def main() -> None:
     res = compare(ref_metrics, engine_metrics, args.topk, report_csv)
 
     # 4) 요약 출력 + 저장
-    log("=" * 56)
+    log("=" * 64)
     log(f"검증 리포트: 기준={ref_name}  vs  엔진({args.engine}/{args.backend}, model={args.model if args.engine=='lane' else 'n/a'})")
     log(f"  매칭 edge 수: {res['matched_edges']}")
     for m, s in res["metrics"].items():
-        log(f"  {m:20s}  r={s['pearson_r']:.4f}  MAE={s['mae']:.4f}  RMSE={s['rmse']:.4f}")
-    log(f"  혼잡 hotspot(top-{res['hotspot_topk']}) 일치: "
-        f"{res['hotspot_overlap']}  Jaccard={res['hotspot_jaccard']:.4f}")
+        extra = f"  GEH<5={s['geh_lt5_frac']*100:.1f}%" if "geh_lt5_frac" in s else ""
+        log(f"  {m:20s}  r={s['pearson_r']:.4f}  rho={s['spearman_rho']:.4f}  "
+            f"RMSN={s['rmsn']:.4f}  MAE={s['mae']:.4f}{extra}")
+    log(f"  혼잡 hotspot(top-{res['hotspot_topk']}): "
+        f"precision={res['hotspot_precision']:.3f} recall={res['hotspot_recall']:.3f} "
+        f"(Jaccard={res['hotspot_jaccard']:.3f}, overlap {res['hotspot_overlap']})")
     log(f"  edgewise CSV: {report_csv}")
-    log("=" * 56)
+    log("=" * 64)
 
     summary_csv = Path(f"{out_prefix}_summary.csv")
     with summary_csv.open("w", newline="", encoding="utf-8") as f:
         w = csv.writer(f)
-        w.writerow(["metric", "pearson_r", "mae", "rmse"])
+        w.writerow(["metric", "pearson_r", "spearman_rho", "rmsn", "mae", "rmse", "geh_lt5_frac"])
         for m, s in res["metrics"].items():
-            w.writerow([m, f"{s['pearson_r']:.6f}", f"{s['mae']:.6f}", f"{s['rmse']:.6f}"])
-        w.writerow(["hotspot_jaccard", f"{res['hotspot_jaccard']:.6f}", res["hotspot_overlap"], f"top{res['hotspot_topk']}"])
+            w.writerow([m, f"{s['pearson_r']:.6f}", f"{s['spearman_rho']:.6f}",
+                        f"{s['rmsn']:.6f}", f"{s['mae']:.6f}", f"{s['rmse']:.6f}",
+                        f"{s.get('geh_lt5_frac', float('nan')):.6f}"])
+        w.writerow(["hotspot_topk", res["hotspot_topk"], "", "", "", "", ""])
+        w.writerow(["hotspot_precision", f"{res['hotspot_precision']:.6f}", "", "", "", "", ""])
+        w.writerow(["hotspot_recall", f"{res['hotspot_recall']:.6f}", "", "", "", "", ""])
+        w.writerow(["hotspot_jaccard", f"{res['hotspot_jaccard']:.6f}", res["hotspot_overlap"], "", "", "", ""])
     log(f"요약 저장: {summary_csv}")
 
 
