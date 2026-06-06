@@ -95,6 +95,17 @@ def run_sim(args) -> None:
         v = vmax * (1.0 - dens / rho_jam)
         return np.maximum(v, min_speed)
 
+    # 단일 차량 궤적 추적(검증용): id → 인덱스
+    track_idx = -1
+    track_rows: list = []
+    if args.track_vehicle:
+        id2i = {vid: i for i, vid in enumerate(net.veh_ids)}
+        track_idx = id2i.get(args.track_vehicle, -1)
+        if track_idx < 0:
+            log(f"[track] 차량 id={args.track_vehicle} 없음 — 추적 생략")
+        else:
+            log(f"[track] 차량 {args.track_vehicle}(idx={track_idx}) 위치 추적 시작")
+
     dep_ptr = 0  # veh_depart 정렬 포인터
     t0 = time.perf_counter()
     t = 0.0
@@ -204,6 +215,18 @@ def run_sim(args) -> None:
         acc_count += edge_count * dt
         t_acc += dt
 
+        # (검증) 추적 차량의 위치 기록: 어느 edge의 몇 m 지점 + 누적거리 + 상태
+        if track_idx >= 0:
+            st = int(state[track_idx])
+            ei = int(cur_edge[track_idx])
+            cum = float(route_dist[track_idx] + (pos_m[track_idx] if st in (STATE_RUN, STATE_QUEUE) else 0.0))
+            track_rows.append([
+                f"{t:.1f}", {0: "PRE", 1: "RUN", 2: "QUEUE", 3: "DONE"}[st],
+                (net.edge_ids[ei] if ei >= 0 else "-"),
+                f"{float(pos_m[track_idx]):.2f}", f"{cum:.2f}",
+                f"{int(cur_pos[track_idx])}", f"{int(veh_len[track_idx])}",
+            ])
+
         if (step + 1) % args.log_interval == 0:
             running = int((state == STATE_RUN).sum())
             queued = int((state == STATE_QUEUE).sum())
@@ -214,6 +237,16 @@ def run_sim(args) -> None:
     elapsed = time.perf_counter() - t0
     n_arr = int((state == STATE_DONE).sum())
     log(f"meso 시뮬레이션 완료: {elapsed:.2f}s ({n_steps} steps), 도착={n_arr}/{V}")
+
+    # (검증) 추적 차량 궤적 저장
+    if track_idx >= 0 and args.track_output:
+        out = Path(args.track_output); out.parent.mkdir(parents=True, exist_ok=True)
+        with out.open("w", newline="", encoding="utf-8") as f:
+            w = csv.writer(f)
+            w.writerow(["t_s", "state", "edge_id", "pos_m_on_edge", "cum_dist_m", "route_idx", "route_len"])
+            w.writerows(track_rows)
+        moved = [r for r in track_rows if r[1] in ("RUN", "QUEUE")]
+        log(f"[track] 궤적 저장: {out} ({len(track_rows)} steps, 이동구간 {len(moved)} steps)")
 
     # --- 차량별 통행시간 출력 ---
     if args.trip_output_csv:
@@ -264,6 +297,8 @@ def main() -> None:
     p.add_argument("--junction-delay", type=float, default=0.0,
                    help="edge 전이(교차로 통과)마다 추가되는 고정 지연(s). 신호/양보 대기 근사. ~10s가 현실적")
     p.add_argument("--max-vehicles", type=int, default=0, help=">0이면 출발순 앞쪽 N대만(테스트)")
+    p.add_argument("--track-vehicle", default="", help="검증용: 이 차량 id의 위치를 매 스텝 기록")
+    p.add_argument("--track-output", default="./gangnam4_cuda/results/track.csv", help="추적 궤적 CSV 경로")
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--log-interval", type=int, default=600)
     p.add_argument("--trip-output-csv", default="./gangnam4_cuda/results/meso_trips.csv")
