@@ -88,6 +88,8 @@ def run_sim(args) -> None:
 
     min_speed = float(args.min_speed)
     jct_delay = float(args.junction_delay)
+    cong_coef = float(args.junction_cong_coef)
+    max_jct_delay = float(args.max_junction_delay)
 
     def edge_speed_all() -> np.ndarray:
         """모든 edge의 현재 밀도 기반 Greenshields 속도(>= min_speed). [E]"""
@@ -185,7 +187,14 @@ def run_sim(args) -> None:
                     cur_edge[mv] = mv_ne.astype(np.int32)
                     enter_time[mv] = t
                     pos_m[mv] = 0.0
-                    hold_until[mv] = t + jct_delay   # 교차로 통과 지연
+                    # 교차로 통과 지연: base + 혼잡비례(목적지 점유율 occ의 Webster-overflow형)
+                    if cong_coef > 0.0:
+                        occ = np.clip(edge_count[mv_ne] / np.maximum(jam_storage[mv_ne], 1e-9), 0.0, 0.99)
+                        delay = jct_delay + cong_coef * occ / (1.0 - occ)
+                        np.minimum(delay, max_jct_delay, out=delay)
+                        hold_until[mv] = t + delay
+                    else:
+                        hold_until[mv] = t + jct_delay
                     np.add.at(edge_count, mv_ne, 1)
                     state[mv] = STATE_RUN
 
@@ -295,7 +304,11 @@ def main() -> None:
     p.add_argument("--min-speed", type=float, default=0.3,
                    help="혼잡 edge 최소 통과속도(m/s). 낮을수록 jam에서 더 오래 정체→SUMO 통행시간에 근접. 0.3=기본")
     p.add_argument("--junction-delay", type=float, default=0.0,
-                   help="edge 전이(교차로 통과)마다 추가되는 고정 지연(s). 신호/양보 대기 근사. ~10s가 현실적")
+                   help="edge 전이(교차로 통과) 고정 base 지연(s). 신호/양보 대기 근사")
+    p.add_argument("--junction-cong-coef", type=float, default=0.0,
+                   help="혼잡비례 지연 계수. delay=base+coef*occ/(1-occ) (occ=목적지 점유율). Webster-overflow형")
+    p.add_argument("--max-junction-delay", type=float, default=120.0,
+                   help="혼잡비례 지연 상한(s)")
     p.add_argument("--max-vehicles", type=int, default=0, help=">0이면 출발순 앞쪽 N대만(테스트)")
     p.add_argument("--track-vehicle", default="", help="검증용: 이 차량 id의 위치를 매 스텝 기록")
     p.add_argument("--track-output", default="./gangnam4_cuda/results/track.csv", help="추적 궤적 CSV 경로")
