@@ -85,6 +85,7 @@ __global__ void k_recv(const int V, const signed char* state, const int* cur_edg
 }
 
 __global__ void k_apply_disch(const int V, const double* t_dev, const double jct_delay,
+        const double cong_coef, const double max_jct_delay,
         signed char* state, int* cur_edge, int* cur_pos, const int* next_edge,
         const int* recv_rank, const double* jam_storage, const int* edge_count_snap,
         int* edge_count, double* out_credit, double* edge_exits, double* arrival_time,
@@ -107,7 +108,15 @@ __global__ void k_apply_disch(const int V, const double* t_dev, const double jct
     else {
         route_dist[i] += length[e];
         cur_pos[i] += 1; cur_edge[i]=ne; enter_time[i]=t; pos_m[i]=0.0;
-        hold_until[i]=t+jct_delay;
+        // 교차로 지연: base + 혼잡비례(목적지 점유율 occ의 Webster-overflow형)
+        double d = jct_delay;
+        if(cong_coef > 0.0){
+            double occ = (double)edge_count_snap[ne] / fmax(jam_storage[ne], 1e-9);
+            if(occ > 0.99) occ = 0.99;
+            d = jct_delay + cong_coef * occ / (1.0 - occ);
+            if(d > max_jct_delay) d = max_jct_delay;
+        }
+        hold_until[i]=t+d;
         atomicAdd(&edge_count[ne], 1); state[i]=1;                  // RUN
     }
 }
@@ -228,10 +237,11 @@ def run_sim(args) -> None:
         K["k_recv"]((gV,), (TPB,), (i32(V), state, cur_edge, cur_pos, veh_off, veh_len,
                    redges, out_credit, send_rank, recv_counter, next_edge, recv_rank))
         cp.copyto(ecount_snap, edge_count)
-        K["k_apply_disch"]((gV,), (TPB,), (i32(V), t_dev, f64(jct_delay), state, cur_edge,
-                          cur_pos, next_edge, recv_rank, jam_storage, ecount_snap, edge_count,
-                          out_credit, edge_exits, arrival_time, route_dist, length, pos_m,
-                          enter_time, hold_until))
+        K["k_apply_disch"]((gV,), (TPB,), (i32(V), t_dev, f64(jct_delay),
+                          f64(args.junction_cong_coef), f64(args.max_junction_delay),
+                          state, cur_edge, cur_pos, next_edge, recv_rank, jam_storage,
+                          ecount_snap, edge_count, out_credit, edge_exits, arrival_time,
+                          route_dist, length, pos_m, enter_time, hold_until))
         dep_counter.fill(0)
         K["k_dep_ticket"]((gV,), (TPB,), (i32(V), t_dev, state, veh_depart, veh_off, redges,
                          dep_counter, first_edge, dep_rank))
@@ -320,6 +330,9 @@ def main():
     p.add_argument("--vmax-scale", type=float, default=1.0)
     p.add_argument("--min-speed", type=float, default=0.3)
     p.add_argument("--junction-delay", type=float, default=0.0)
+    p.add_argument("--junction-cong-coef", type=float, default=0.0,
+                   help="혼잡비례 지연 계수: delay=base+coef*occ/(1-occ)")
+    p.add_argument("--max-junction-delay", type=float, default=120.0)
     p.add_argument("--max-vehicles", type=int, default=0)
     p.add_argument("--no-graph", action="store_true", help="CUDA Graph 미사용(branch-free만)")
     p.add_argument("--trip-output-csv", default="", help="차량별 통행시간 CSV(검증용)")
