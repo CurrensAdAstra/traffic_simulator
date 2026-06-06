@@ -274,6 +274,25 @@ def run_sim(args) -> None:
     mode = "graph" if use_graph else "no-graph"
     log(f"meso-GPU(branch-free,{mode}) 완료: {elapsed:.2f}s ({n_steps} steps), 도착={n_arr}/{V}")
 
+    # 차량별 통행시간(검증축) — graph 엔진도 meso의 fidelity 유지하는지 확인용
+    if args.trip_output_csv:
+        st_h = cp.asnumpy(state); start_h = cp.asnumpy(start_time)
+        arr_h = cp.asnumpy(arrival_time); dist_h = cp.asnumpy(route_dist)
+        tt = arr_h - start_h
+        valid = (st_h == 3) & (start_h >= 0)
+        out = Path(args.trip_output_csv); out.parent.mkdir(parents=True, exist_ok=True)
+        with out.open("w", newline="") as f:
+            w = csv.writer(f)
+            w.writerow(["veh_id", "depart", "start", "arrival", "travel_time_s", "route_dist_m", "mean_speed_mps"])
+            for v in np.flatnonzero(valid):
+                d = float(dist_h[v]); dur = float(tt[v])
+                w.writerow([net.veh_ids[v], float(net.veh_depart[v]), float(start_h[v]),
+                            float(arr_h[v]), dur, d, (d / dur if dur > 0 else 0.0)])
+        log(f"차량 통행시간 저장: {out} (완주 {int(valid.sum())}대)")
+        if valid.any():
+            durs = tt[valid]
+            log(f"통행시간 통계: mean={durs.mean():.1f}s median={np.median(durs):.1f}s p95={np.percentile(durs,95):.1f}s")
+
     if args.edge_output_csv:
         t_acc = n_steps * dt
         mean_count = cp.asnumpy(acc_count) / max(t_acc, 1.0)
@@ -303,6 +322,7 @@ def main():
     p.add_argument("--junction-delay", type=float, default=0.0)
     p.add_argument("--max-vehicles", type=int, default=0)
     p.add_argument("--no-graph", action="store_true", help="CUDA Graph 미사용(branch-free만)")
+    p.add_argument("--trip-output-csv", default="", help="차량별 통행시간 CSV(검증용)")
     p.add_argument("--edge-output-csv", default="./gangnam4_cuda/results/meso_gpu_graph.edge.csv")
     args = p.parse_args()
     run_sim(args)
