@@ -38,6 +38,19 @@ def within_group_rank_gpu(cp, group, order):
     return out
 
 
+def build_ticket_kernel(cp):
+    """그룹 내 순위를 atomicAdd로 부여(정렬 불필요). rank[i] = (그 그룹에서 i보다 먼저 처리된 수).
+    순서는 비결정적이지만 그룹당 capacity 배분에는 충분(메소 근사). lexsort O(NlogN) 제거."""
+    return cp.RawKernel(r'''
+    extern "C" __global__
+    void ticket(const int n, const int* group, int* counter, int* rank){
+        int i = blockDim.x*blockIdx.x + threadIdx.x;
+        if (i >= n) return;
+        rank[i] = atomicAdd(&counter[group[i]], 1);
+    }
+    ''', "ticket")
+
+
 def run_sim(args) -> None:
     try:
         import cupy as cp  # type: ignore
@@ -93,6 +106,24 @@ def run_sim(args) -> None:
     def edge_speed_all():
         dens = edge_count / cp.maximum(length * lanes, 1.0)
         return cp.maximum(vmax * (1.0 - dens / rho_jam), min_speed)
+
+    # 그룹 내 순위: sort(lexsort, 정확 FIFO) 또는 ticket(atomic, 정렬無 근사)
+    rank_mode = args.rank_mode
+    ticket_kernel = build_ticket_kernel(cp) if rank_mode == "ticket" else None
+    _tcounter = cp.zeros(E, dtype=cp.int32)  # ticket용 그룹 카운터(edge별)
+
+    def group_rank(group_i64, order_f64, group_for_ticket_i32):
+        """rank_mode에 따라 그룹 내 순위 반환(int64). ticket은 order 무시(비FIFO 근사)."""
+        if rank_mode == "sort":
+            return within_group_rank_gpu(cp, group_i64, order_f64)
+        n = group_for_ticket_i32.size
+        if n == 0:
+            return cp.zeros(0, dtype=cp.int64)
+        _tcounter.fill(0)
+        rank = cp.empty(n, dtype=cp.int32)
+        threads = 256; blocks = (n + threads - 1) // threads
+        ticket_kernel((blocks,), (threads,), (np.int32(n), group_for_ticket_i32, _tcounter, rank))
+        return rank.astype(cp.int64)
 
     # 단일 차량 궤적 추적(검증용)
     track_idx = -1
@@ -150,7 +181,8 @@ def run_sim(args) -> None:
                 ne[inq] = redges[veh_off[q[inq]] + npos[inq]]
             mark("disch_setup")
 
-            send_rank = within_group_rank_gpu(cp, ce.astype(cp.int64), enter_time[q])
+            ce32 = ce.astype(cp.int32)
+            send_rank = group_rank(ce.astype(cp.int64), enter_time[q], ce32)
             send_cap = cp.floor(out_credit[ce]).astype(cp.int64)
             elig_send = send_rank < send_cap
             mark("sort_send")
@@ -160,7 +192,7 @@ def run_sim(args) -> None:
             move_in = cand & (~is_exit)
             if bool(move_in.any()):
                 gi = ne[move_in]
-                recv_rank = within_group_rank_gpu(cp, gi.astype(cp.int64), enter_time[q][move_in])
+                recv_rank = group_rank(gi.astype(cp.int64), enter_time[q][move_in], gi.astype(cp.int32))
                 recv_ok = recv_rank < cp.maximum(space[gi], 0)
                 tmp = cp.flatnonzero(move_in)
                 cand[tmp[~recv_ok]] = False
@@ -195,7 +227,7 @@ def run_sim(args) -> None:
         cand_dep = cp.flatnonzero((state == STATE_PRE) & (veh_depart <= t))
         if cand_dep.size > 0:
             e0 = redges[veh_off[cand_dep]]
-            drank = within_group_rank_gpu(cp, e0.astype(cp.int64), veh_depart[cand_dep])
+            drank = group_rank(e0.astype(cp.int64), veh_depart[cand_dep], e0.astype(cp.int32))
             space0 = cp.floor(jam_storage - edge_count).astype(cp.int64)
             ok = drank < cp.maximum(space0[e0], 0)
             ins = cand_dep[ok]
@@ -311,6 +343,8 @@ def main() -> None:
     p.add_argument("--track-vehicle", default="", help="검증용: 이 차량 id 위치를 매 스텝 기록")
     p.add_argument("--track-output", default="./gangnam4_cuda/results/track_gpu.csv")
     p.add_argument("--profile", action="store_true", help="스텝 섹션별 시간 분해(sync 포함, 절대값은 관측자효과로 부풀려짐)")
+    p.add_argument("--rank-mode", default="sort", choices=["sort", "ticket"],
+                   help="그룹내 순위: sort(lexsort, 정확 FIFO) | ticket(atomic, 정렬無 근사·고속)")
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--log-interval", type=int, default=600)
     p.add_argument("--trip-output-csv", default="./gangnam4_cuda/results/meso_gpu_trips.csv")
