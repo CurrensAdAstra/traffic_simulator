@@ -103,10 +103,24 @@ def run_sim(args) -> None:
         if track_idx >= 0:
             log(f"[track] 차량 {args.track_vehicle}(idx={track_idx}) 위치 추적 시작")
 
+    # --- 프로파일링: 섹션 경계마다 mark() (sync 후 직전 mark 이후 경과시간 누적) ---
+    do_prof = args.profile
+    prof: dict = {}
+    _last = [0.0]
+    def mark(name: str):
+        if not do_prof:
+            return
+        cp.cuda.runtime.deviceSynchronize()
+        now = time.perf_counter()
+        prof[name] = prof.get(name, 0.0) + (now - _last[0])
+        _last[0] = now
+
     cp.cuda.runtime.deviceSynchronize()
     t0 = time.perf_counter()
     for step in range(n_steps):
         t = step * dt
+        if do_prof:
+            cp.cuda.runtime.deviceSynchronize(); _last[0] = time.perf_counter()
         espeed = edge_speed_all()
 
         # 1) running 위치 전진(hold_until 경과분만), length 도달 → queue
@@ -118,6 +132,7 @@ def run_sim(args) -> None:
                 pos_m[active] += espeed[cur_edge[active]] * dt
                 reached = active[pos_m[active] >= length[cur_edge[active]]]
                 state[reached] = STATE_QUEUE
+        mark("advance")
 
         # 2) 유출 capacity 누적
         out_credit += sat_cap * dt
@@ -133,10 +148,12 @@ def run_sim(args) -> None:
             inq = ~is_exit
             if bool(inq.any()):
                 ne[inq] = redges[veh_off[q[inq]] + npos[inq]]
+            mark("disch_setup")
 
             send_rank = within_group_rank_gpu(cp, ce.astype(cp.int64), enter_time[q])
             send_cap = cp.floor(out_credit[ce]).astype(cp.int64)
             elig_send = send_rank < send_cap
+            mark("sort_send")
 
             space = cp.floor(jam_storage - edge_count).astype(cp.int64)
             cand = elig_send.copy()
@@ -147,6 +164,7 @@ def run_sim(args) -> None:
                 recv_ok = recv_rank < cp.maximum(space[gi], 0)
                 tmp = cp.flatnonzero(move_in)
                 cand[tmp[~recv_ok]] = False
+            mark("sort_recv")
 
             movers = cp.flatnonzero(cand)
             if movers.size > 0:
@@ -171,6 +189,7 @@ def run_sim(args) -> None:
                     hold_until[mv] = t + jct_delay
                     scatter_add(edge_count, mv_ne, cp.int32(1))
                     state[mv] = STATE_RUN
+            mark("disch_apply")
 
         # 4) Departures: PRE & depart<=t, 첫 edge space 한도
         cand_dep = cp.flatnonzero((state == STATE_PRE) & (veh_depart <= t))
@@ -189,10 +208,12 @@ def run_sim(args) -> None:
                 start_time[ins] = t
                 pos_m[ins] = 0.0
                 scatter_add(edge_count, ie, cp.int32(1))
+        mark("departures")
 
         # 5) edge 시간평균 누적
         acc_count += edge_count.astype(cp.float64) * dt
         t_acc += dt
+        mark("accumulate")
 
         # (검증) 추적 차량 위치 — device 스칼라 1개씩 host로
         if track_idx >= 0:
@@ -216,6 +237,19 @@ def run_sim(args) -> None:
     elapsed = time.perf_counter() - t0
     n_arr = int((state == STATE_DONE).sum())
     log(f"meso-GPU 시뮬레이션 완료: {elapsed:.2f}s ({n_steps} steps), 도착={n_arr}/{V}")
+
+    if do_prof and prof:
+        tot = sum(prof.values())
+        log("=" * 56)
+        log(f"[PROFILE] 섹션별 GPU+host 시간 (instrumented 합 {tot:.2f}s, 관측자효과로 부풀려짐)")
+        order = ["advance", "disch_setup", "sort_send", "sort_recv", "disch_apply", "departures", "accumulate"]
+        for k in order + [x for x in prof if x not in order]:
+            if k in prof:
+                log(f"  {k:14s} {prof[k]:8.2f}s  {100*prof[k]/tot:5.1f}%")
+        sort_pct = 100 * (prof.get("sort_send", 0) + prof.get("sort_recv", 0) +
+                          prof.get("departures", 0)) / tot
+        log(f"  → 정렬(lexsort) 계열 합: ~{sort_pct:.0f}%  (send+recv+departures 내 rank)")
+        log("=" * 56)
 
     if track_idx >= 0 and args.track_output:
         out = Path(args.track_output); out.parent.mkdir(parents=True, exist_ok=True)
@@ -276,6 +310,7 @@ def main() -> None:
     p.add_argument("--max-vehicles", type=int, default=0)
     p.add_argument("--track-vehicle", default="", help="검증용: 이 차량 id 위치를 매 스텝 기록")
     p.add_argument("--track-output", default="./gangnam4_cuda/results/track_gpu.csv")
+    p.add_argument("--profile", action="store_true", help="스텝 섹션별 시간 분해(sync 포함, 절대값은 관측자효과로 부풀려짐)")
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--log-interval", type=int, default=600)
     p.add_argument("--trip-output-csv", default="./gangnam4_cuda/results/meso_gpu_trips.csv")
