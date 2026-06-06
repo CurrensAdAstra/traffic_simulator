@@ -113,6 +113,21 @@ def build_cmd(system: str, args, tmp: Path) -> tuple[list[str], dict]:
                "-v", f"{ws}:/workspace", "-v", f"{_HERE}:/workspace/gangnam4_cuda",
                "-w", "/workspace", args.docker_image, "bash", "-lc", inner]
         return cmd, {"steps": int(round(args.sim_time / args.meso_dt)), "dt": args.meso_dt}
+    if system == "meso_gpu_graph":
+        gpu = _HERE / "meso_gpu_graph.py"
+        if not gpu.exists():
+            return None, {}
+        ws = Path(args.workspace).resolve()
+        net_c = "/workspace/" + str(Path(args.net_file).resolve().relative_to(ws))
+        route_c = "/workspace/" + str(Path(args.route_file).resolve().relative_to(ws))
+        edge_out = "/workspace/map_import/_bench_mesogpugraph.edge.csv"
+        inner = (f"python3 /workspace/gangnam4_cuda/meso_gpu_graph.py "
+                 f"--net-file {net_c} --route-file {route_c} --sim-time {args.sim_time} "
+                 f"--dt {args.meso_dt} --edge-output-csv {edge_out}")
+        cmd = ["docker", "run", "--rm", "--gpus", "all",
+               "-v", f"{ws}:/workspace", "-v", f"{_HERE}:/workspace/gangnam4_cuda",
+               "-w", "/workspace", args.docker_image, "bash", "-lc", inner]
+        return cmd, {"steps": int(round(args.sim_time / args.meso_dt)), "dt": args.meso_dt}
     return None, {}
 
 
