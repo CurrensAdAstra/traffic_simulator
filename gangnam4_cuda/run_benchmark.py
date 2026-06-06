@@ -102,10 +102,15 @@ def build_cmd(system: str, args, tmp: Path) -> tuple[list[str], dict]:
         ws = Path(args.workspace).resolve()
         net_c = "/workspace/" + str(Path(args.net_file).resolve().relative_to(ws))
         route_c = "/workspace/" + str(Path(args.route_file).resolve().relative_to(ws))
-        inner = (f"python3 /workspace/{Path(gpu).resolve().relative_to(ws)} "
+        # 엔진 코드는 _HERE(워크트리)에 있고 /workspace(메인 체크아웃)엔 없을 수 있으므로
+        # _HERE를 /workspace/gangnam4_cuda 위에 오버레이 마운트한다.
+        edge_out = "/workspace/map_import/_bench_mesogpu.edge.csv"
+        inner = (f"python3 /workspace/gangnam4_cuda/meso_gpu.py "
                  f"--net-file {net_c} --route-file {route_c} --sim-time {args.sim_time} "
-                 f"--dt {args.meso_dt} --log-interval 999999 --edge-output-csv /workspace/{Path(tmp).resolve().relative_to(ws)}/mesogpu.edge.csv")
-        cmd = ["docker", "run", "--rm", "--gpus", "all", "-v", f"{ws}:/workspace",
+                 f"--dt {args.meso_dt} --log-interval 999999 --trip-output-csv '' "
+                 f"--edge-output-csv {edge_out}")
+        cmd = ["docker", "run", "--rm", "--gpus", "all",
+               "-v", f"{ws}:/workspace", "-v", f"{_HERE}:/workspace/gangnam4_cuda",
                "-w", "/workspace", args.docker_image, "bash", "-lc", inner]
         return cmd, {"steps": int(round(args.sim_time / args.meso_dt)), "dt": args.meso_dt}
     return None, {}
