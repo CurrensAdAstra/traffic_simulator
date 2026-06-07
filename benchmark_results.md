@@ -62,6 +62,41 @@ meso-CPU at 1M**, and lands in the macro-CTM performance regime (CTM @1M ≈
 algorithm's data-flow structure (eliminate global sync/sort, fix kernel shapes,
 capture as a graph), not just porting the existing loop to the GPU.
 
+## Accuracy refinements (this study)
+
+Two model-fidelity additions, both validated against SUMO per-vehicle tripinfo
+and ported to the graph engine (kept at full speed):
+
+**A. Congestion-dependent junction delay.** Replace the flat per-crossing delay
+with a Webster-overflow-like form: `delay = base + coef · occ/(1−occ)`, occ =
+destination-edge occupancy, capped. Concentrates delay at congested junctions,
+matching SUMO's spatially-varying pattern. Gangnam-20k vs SUMO tripinfo:
+
+| config | Pearson r | bias | finding |
+| --- | --- | --- | --- |
+| no delay | 0.445 | −628 s | baseline |
+| flat (jd=8 s) | **0.386** ↓ | +448 s | uniform delay hurt correlation |
+| **cong-coef=10** | **0.484** ↑ | −106 s | **both r and bias improve** |
+| cong-coef=15 | 0.469 | +7 s (≈0) | bias fully closed |
+
+A flat delay traded correlation for bias; congestion-dependent delay improves
+both simultaneously — the first model change that does so.
+
+**B. Graph-engine accuracy parity (split-discharge fix).** The single-kernel
+discharge in the initial graph engine read destination occupancy *before*
+senders left, slightly inflating congestion-delay and depressing per-vehicle r
+(0.484 CPU → 0.455 graph). Splitting discharge into `leave → snapshot → enter`
+restores the CPU's post-leave/pre-enter occupancy timing.
+
+| engine | Pearson r | wall (7200 steps, 20k) |
+| --- | --- | --- |
+| CPU meso | 0.484 | 7 s |
+| graph meso (single discharge) | 0.455 | 0.20 s |
+| **graph meso (split-discharge)** | **0.484** | **0.21 s** |
+
+Net: the GPU graph engine now matches CPU per-vehicle correlation **to three
+decimals** at ~35× lower wall time — full speed-and-accuracy parity.
+
 ## Speed–accuracy positioning (which engine when)
 
 - **Macro-CTM (CPU/GPU):** fastest at scale (demand-independent), best at
