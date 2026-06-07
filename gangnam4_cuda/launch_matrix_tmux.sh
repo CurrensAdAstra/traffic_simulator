@@ -23,7 +23,7 @@ case "$action" in
     else
       echo "[status] 세션 '$SESSION' 실행중"
     fi
-    echo "---- 최근 진행 마커 ----"; grep -E "^\[CELL\]|^\[ETA\]|^\[LOG\] 매트릭스" "$LOG" 2>/dev/null | tail -20
+    echo "---- 최근 진행 마커 ----"; grep -E "^\[COMBO\]|^\[CELL\]|^\[ETA\]|^\[LOG\] 매트릭스" "$LOG" 2>/dev/null | tail -20
     echo "---- master 행 수 ----"; [[ -f "$WT/paper_data/matrix/matrix.csv" ]] && wc -l "$WT/paper_data/matrix/matrix.csv" || echo "matrix.csv 없음"
     ;;
   --tail)

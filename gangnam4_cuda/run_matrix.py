@@ -30,9 +30,11 @@ _WALL = re.compile(r"완료:\s*([0-9.]+)s")
 
 
 def log(m): print(f"[LOG] {m}", flush=True)
-def cell_log(net, dem, cfg, msg): print(f"[CELL] net={net} dem={dem} cfg={cfg} :: {msg}", flush=True)
+# "COMBO" = (network, demand) 한 조합 (혼동 방지: 도로/차량이 아니라 매트릭스 한 칸).
+# 별도로 cell_common.py의 "cell"은 도로 공간 격자 — 둘은 무관.
+def combo_log(net, dem, cfg, msg): print(f"[COMBO] net={net} dem={dem} cfg={cfg} :: {msg}", flush=True)
 def eta_log(done, total, t_elapsed): print(f"[ETA] done={done}/{total} elapsed={t_elapsed:.0f}s "
-    f"avg_per_cell={(t_elapsed/max(done,1)):.0f}s remain~{(t_elapsed/max(done,1))*(total-done):.0f}s", flush=True)
+    f"avg_per_combo={(t_elapsed/max(done,1)):.0f}s remain~{(t_elapsed/max(done,1))*(total-done):.0f}s", flush=True)
 
 
 def sumo_edgedata(args, route_path: Path, edge_xml: Path, sim_time: float, seed: int = 1000):
@@ -139,9 +141,9 @@ def main():
     all_cfg = args.configs.split(",")
 
     # 셀 enumeration
-    cells = [(nname, nf, bf, st, dem) for (nname, nf, bf, st) in nets for dem in demands]
-    total = len(cells)
-    log(f"매트릭스 시작: networks={len(nets)} demands={len(demands)} cells={total}")
+    combos = [(nname, nf, bf, st, dem) for (nname, nf, bf, st) in nets for dem in demands]
+    total = len(combos)
+    log(f"매트릭스 시작: networks={len(nets)} demands={len(demands)} combos={total}")
 
     # resume용 기존 행
     done_keys = set()
@@ -158,22 +160,22 @@ def main():
                 "density_r","density_rho","hotspot_prec"])
 
     t0 = time.perf_counter()
-    for ci, (nname, nf, bf, st, dem) in enumerate(cells, 1):
-        cell_log(nname, dem, "ALL", f">>> 시작 ({ci}/{total})")
+    for ci, (nname, nf, bf, st, dem) in enumerate(combos, 1):
+        combo_log(nname, dem, "ALL", f">>> 시작 ({ci}/{total})")
         # 수요 route
         rfile = routes_dir / f"{nname}_{dem}.rou.xml"
         try: make_route(args, bf, dem, rfile)
         except Exception as e:
-            cell_log(nname, dem, "ALL", f"route 생성 실패: {e}"); continue
+            combo_log(nname, dem, "ALL", f"route 생성 실패: {e}"); continue
 
         # SUMO ground truth (상한 안에서만)
         sumo_xml = sumo_dir / f"{nname}_{dem}.xml"
         if dem <= args.sumo_cap:
             ok = sumo_edgedata_for_cell(args, nf, rfile, sumo_xml, st)
             if not ok:
-                cell_log(nname, dem, "ALL", "SUMO 실패 → 이 셀 skip"); continue
+                combo_log(nname, dem, "ALL", "SUMO 실패 → 이 셀 skip"); continue
         else:
-            cell_log(nname, dem, "ALL", f"수요 > {args.sumo_cap} → SUMO ground truth 생성 skip(엔진 wall만 측정)")
+            combo_log(nname, dem, "ALL", f"수요 > {args.sumo_cap} → SUMO ground truth 생성 skip(엔진 wall만 측정)")
             sumo_xml = None
 
         # SUMO ref 없으면 정확도 비교 불가 → 엔진 wall만 별도 측정(추후 다른 sweep에서 처리)
@@ -186,12 +188,12 @@ def main():
         cfgs_for_cell = ",".join([c for c in cfgs_for_cell.split(",")
                                   if (nname, dem, c) not in done_keys])
         if not cfgs_for_cell:
-            cell_log(nname, dem, "ALL", "모두 resume됨 → skip"); eta_log(ci, total, time.perf_counter()-t0); continue
+            combo_log(nname, dem, "ALL", "모두 resume됨 → skip"); eta_log(ci, total, time.perf_counter()-t0); continue
 
         cell_csv = cells_dir / f"{nname}_{dem}.csv"
         ok = run_pareto_cell(args, nf, rfile, sumo_xml, cfgs_for_cell, st, cell_csv)
         if not ok or not cell_csv.exists():
-            cell_log(nname, dem, "ALL", "pareto 실패"); continue
+            combo_log(nname, dem, "ALL", "pareto 실패"); continue
         # 셀 결과를 master에 append
         with cell_csv.open() as f, master.open("a", newline="") as fo:
             rd = csv.DictReader(f); w = csv.writer(fo)
@@ -199,7 +201,7 @@ def main():
                 w.writerow([nname, dem, r["config"], r["wall_inner_s"], r["wall_ext_s"], r["matched"],
                     r["flow_geh_lt5"], r["flow_r"], r["flow_rho"], r["speed_r"], r["speed_rho"],
                     r["density_r"], r["density_rho"], r["hotspot_prec"]])
-        cell_log(nname, dem, "ALL", "[OK] master에 누적")
+        combo_log(nname, dem, "ALL", "[OK] master에 누적")
         eta_log(ci, total, time.perf_counter()-t0)
 
     log("매트릭스 완료")
