@@ -84,18 +84,19 @@ __global__ void k_recv(const int V, const signed char* state, const int* cur_edg
     }
 }
 
-__global__ void k_apply_disch(const int V, const double* t_dev, const double jct_delay,
-        const double cong_coef, const double max_jct_delay,
-        signed char* state, int* cur_edge, int* cur_pos, const int* next_edge,
-        const int* recv_rank, const double* jam_storage, const int* edge_count_snap,
+// 1단계: admission 판정 + 송신측 leave (수신 edge_count 변경 X)
+//   admit[i]: -1=not, 0=exit-admitted, 1=move-admitted
+__global__ void k_disch_leave(const int V, const double* t_dev,
+        signed char* state, int* cur_edge, const int* next_edge, const int* recv_rank,
+        const double* jam_storage, const int* edge_count_snap,
         int* edge_count, double* out_credit, double* edge_exits, double* arrival_time,
-        double* route_dist, const double* length, double* pos_m, double* enter_time,
-        double* hold_until){
+        double* route_dist, const double* length, char* admit){
     int i = blockDim.x*blockIdx.x + threadIdx.x; if(i>=V) return;
+    admit[i] = -1;
     int ne = next_edge[i];
-    if(ne == -2) return;                       // not sending
+    if(ne == -2) return;
     bool admitted;
-    if(ne == -1) admitted = true;              // exit always
+    if(ne == -1) admitted = true;
     else { int space = (int)floor(jam_storage[ne]) - edge_count_snap[ne];
            admitted = recv_rank[i] < space; }
     if(!admitted) return;
@@ -104,21 +105,30 @@ __global__ void k_apply_disch(const int V, const double* t_dev, const double jct
     atomicAdd(&edge_count[e], -1);
     atomicAdd(&out_credit[e], -1.0);
     atomicAdd(&edge_exits[e], 1.0);
-    if(ne == -1){ state[i]=3; arrival_time[i]=t; cur_edge[i]=-1; }   // DONE
-    else {
-        route_dist[i] += length[e];
-        cur_pos[i] += 1; cur_edge[i]=ne; enter_time[i]=t; pos_m[i]=0.0;
-        // 교차로 지연: base + 혼잡비례(목적지 점유율 occ의 Webster-overflow형)
-        double d = jct_delay;
-        if(cong_coef > 0.0){
-            double occ = (double)edge_count_snap[ne] / fmax(jam_storage[ne], 1e-9);
-            if(occ > 0.99) occ = 0.99;
-            d = jct_delay + cong_coef * occ / (1.0 - occ);
-            if(d > max_jct_delay) d = max_jct_delay;
-        }
-        hold_until[i]=t+d;
-        atomicAdd(&edge_count[ne], 1); state[i]=1;                  // RUN
+    if(ne == -1){ state[i]=3; arrival_time[i]=t; cur_edge[i]=-1; admit[i]=0; }
+    else { route_dist[i] += length[e]; admit[i]=1; }
+}
+
+// 2단계: 수신측 enter + hold_until (사이에 post-leave occupancy snapshot 사용)
+__global__ void k_disch_enter(const int V, const double* t_dev, const double jct_delay,
+        const double cong_coef, const double max_jct_delay,
+        signed char* state, int* cur_edge, int* cur_pos, const int* next_edge,
+        const char* admit, const double* jam_storage, const int* edge_count_post_leave,
+        int* edge_count, double* pos_m, double* enter_time, double* hold_until){
+    int i = blockDim.x*blockIdx.x + threadIdx.x; if(i>=V) return;
+    if(admit[i] != 1) return;                   // exit/not-admitted는 enter 안 함
+    int ne = next_edge[i]; double t = t_dev[0];
+    cur_pos[i] += 1; cur_edge[i]=ne; enter_time[i]=t; pos_m[i]=0.0;
+    double d = jct_delay;
+    if(cong_coef > 0.0){
+        // CPU와 일치하는 시점: senders가 떠난 후·자기 enter 직전의 점유율
+        double occ = (double)edge_count_post_leave[ne] / fmax(jam_storage[ne], 1e-9);
+        if(occ > 0.99) occ = 0.99;
+        d = jct_delay + cong_coef * occ / (1.0 - occ);
+        if(d > max_jct_delay) d = max_jct_delay;
     }
+    hold_until[i]=t+d;
+    atomicAdd(&edge_count[ne], 1); state[i]=1;
 }
 
 __global__ void k_dep_ticket(const int V, const double* t_dev, const signed char* state,
@@ -176,7 +186,7 @@ def run_sim(args) -> None:
     mod = cp.RawModule(code=KERNELS, options=('--use_fast_math',))
     K = {name: mod.get_function(name) for name in
          ["k_tick","k_edge_speed","k_advance","k_credit","k_send_ticket","k_recv",
-          "k_apply_disch","k_dep_ticket","k_dep_apply","k_accum"]}
+          "k_disch_leave","k_disch_enter","k_dep_ticket","k_dep_apply","k_accum"]}
 
     # 디바이스 배열
     length = cp.asarray(net.length_m, dtype=cp.float64)
@@ -215,6 +225,8 @@ def run_sim(args) -> None:
     dep_rank = cp.zeros(V, dtype=cp.int32)
     ecount_snap = cp.zeros(E, dtype=cp.int32)
     ecount_snap2 = cp.zeros(E, dtype=cp.int32)
+    ecount_postleave = cp.zeros(E, dtype=cp.int32)
+    admit = cp.zeros(V, dtype=cp.int8)
 
     t_dev = cp.zeros(1, dtype=cp.float64)
     step_dev = cp.zeros(1, dtype=cp.int32)
@@ -237,11 +249,15 @@ def run_sim(args) -> None:
         K["k_recv"]((gV,), (TPB,), (i32(V), state, cur_edge, cur_pos, veh_off, veh_len,
                    redges, out_credit, send_rank, recv_counter, next_edge, recv_rank))
         cp.copyto(ecount_snap, edge_count)
-        K["k_apply_disch"]((gV,), (TPB,), (i32(V), t_dev, f64(jct_delay),
+        # 2단 discharge: leave → post-leave snapshot → enter (CPU와 같은 occupancy 시점)
+        K["k_disch_leave"]((gV,), (TPB,), (i32(V), t_dev, state, cur_edge, next_edge,
+                          recv_rank, jam_storage, ecount_snap, edge_count, out_credit,
+                          edge_exits, arrival_time, route_dist, length, admit))
+        cp.copyto(ecount_postleave, edge_count)
+        K["k_disch_enter"]((gV,), (TPB,), (i32(V), t_dev, f64(jct_delay),
                           f64(args.junction_cong_coef), f64(args.max_junction_delay),
-                          state, cur_edge, cur_pos, next_edge, recv_rank, jam_storage,
-                          ecount_snap, edge_count, out_credit, edge_exits, arrival_time,
-                          route_dist, length, pos_m, enter_time, hold_until))
+                          state, cur_edge, cur_pos, next_edge, admit, jam_storage,
+                          ecount_postleave, edge_count, pos_m, enter_time, hold_until))
         dep_counter.fill(0)
         K["k_dep_ticket"]((gV,), (TPB,), (i32(V), t_dev, state, veh_depart, veh_off, redges,
                          dep_counter, first_edge, dep_rank))
