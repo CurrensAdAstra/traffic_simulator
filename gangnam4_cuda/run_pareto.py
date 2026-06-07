@@ -34,7 +34,7 @@ _HERE = Path(__file__).resolve().parent
 _WALL = re.compile(r"완료:\s*([0-9.]+)s")
 
 
-def log(m): print(f"[LOG] {m}")
+def log(m): print(f"[LOG] {m}", flush=True)
 
 
 def run_cmd(cmd, env=None):
