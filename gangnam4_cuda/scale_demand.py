@@ -29,22 +29,29 @@ def main():
     rng = np.random.default_rng(args.seed)
     routes: dict[str, str] = {}
     veh: list[tuple[str, float]] = []  # (route_id, depart)
+    # iterparse 처리: end 이벤트 순서는 자식이 부모보다 먼저 발생.
+    # 따라서 inline <route> (<vehicle><route .../></vehicle>) 도 vehicle보다 먼저 end가 옴.
+    # 직전에 본 inline route의 edges를 보관해 다음 vehicle에 귀속.
+    last_inline_edges: list[str] = []   # stack (보통 길이 0/1)
     for _, el in ET.iterparse(args.in_route, events=("end",)):
         if el.tag == "route":
             rid = el.get("id")
+            edges_str = el.get("edges", "")
             if rid:
-                routes[rid] = el.get("edges", "")
+                routes[rid] = edges_str
+            else:
+                last_inline_edges.append(edges_str)
             el.clear()
         elif el.tag == "vehicle":
             rid = el.get("route", "")
-            if rid in routes or rid == "":
+            if rid and rid in routes:
                 veh.append((rid, float(el.get("depart", "0"))))
-            # vehicle 내부 route 처리
-            rn = el.find("route")
-            if rn is not None and rid == "":
+            elif last_inline_edges:
+                edges_str = last_inline_edges.pop()
                 k = f"_inl{len(routes)}"
-                routes[k] = rn.get("edges", "")
-                veh[-1] = (k, veh[-1][1])
+                routes[k] = edges_str
+                veh.append((k, float(el.get("depart", "0"))))
+            # rid 매칭 안 되고 inline도 없으면 skip
             el.clear()
 
     n0 = len(veh)
