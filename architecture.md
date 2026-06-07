@@ -1,24 +1,37 @@
-# Architecture — Gangnam-4 Edge-Parallel Traffic Simulator
+# Architecture — GPU-Accelerated Multi-Resolution Traffic Simulator
 
 ## Overview
 
-This project is a SUMO-independent traffic simulator for the Gangnam-4-district
-road network, evolved through three engine families of increasing fidelity, all
-validated against SUMO and all in `gangnam4_cuda/`:
+SUMO-independent traffic simulators for the Gangnam-4-district road network,
+evolved through three engine families and **five validated simulator
+configurations** suitable for a head-to-head performance/accuracy study:
+
+| # | Simulator | Where | Status |
+| --- | --- | --- | --- |
+| 1 | **SUMO microscopic** | Docker (SUMO 1.27) | reference |
+| 2 | **Macro CTM (CPU)** | `lane_cpu_simulator_mt.py` | gen-2 CPU baseline |
+| 3 | **Macro CTM (GPU)** | `lane_cuda_simulator.py` | gather + fused + CUDA-Graph |
+| 4 | **Mesoscopic (CPU)** | `meso_sim.py` | gen-3 vehicle-level CPU |
+| 5 | **Mesoscopic (GPU)** | `meso_gpu_graph.py` (redesigned) | branch-free + CUDA-Graph |
+
+Three engine families, each rooted in `gangnam4_cuda/`:
 
 1. **Edge macro** (gen-1) — one LWR density cell per road *edge*. CPU + GPU.
-2. **Lane macro / CTM** (gen-2) — one cell per *lane*, Daganzo Cell-Transmission
-   Model with sending/receiving flux, priority/yield merge, route-derived turn
-   split, per-movement (HCM) capacity, and a global free-flow calibration
-   (`--vmax-scale`). CPU + GPU. The GPU path is fully gather-based (no
-   atomics), fused into ~9 kernels, and CUDA-Graph-captured → **0.09 s for a
-   1-hour, 100k-vehicle sim on an RTX 3090** (~24,000× faster than SUMO).
-3. **Mesoscopic** (gen-3) — individual *vehicles* routed edge-to-edge via a
-   time-stepped spatial-queue model. Produces per-vehicle travel times (a
-   validation axis the macro engines can't reach) and wins decisively on
-   flow/speed/density correlation vs SUMO.
+2. **Lane macro / CTM** (gen-2) — one cell per *lane*, Daganzo CTM with
+   sending/receiving flux, priority/yield, route-derived turn split, HCM
+   per-movement capacity, global FD calibration (`--vmax-scale`). GPU path
+   is gather-only (no atomics), fused into ~9 kernels, CUDA-Graph-captured →
+   **0.09 s for a 1-hour, 100k-vehicle sim on RTX 3090** (~24,000× SUMO).
+3. **Mesoscopic** (gen-3) — *vehicles* routed edge-to-edge in a time-stepped
+   spatial-queue model. Outputs per-vehicle travel times (a validation axis
+   macro can't reach). The naive GPU port hit the ~10× "mesoscopic GPU
+   ceiling" reported by prior work; the redesigned `meso_gpu_graph.py`
+   (branch-free, sync-free, atomic-ticket FIFO, full CUDA-Graph capture)
+   breaks that ceiling — **57–172× over the naive port, ~600× over CPU at
+   1M vehicles**, reaching macro-CTM speed regime while keeping vehicle
+   fidelity (per-vehicle r=0.484 = CPU meso, GEH<5 ≥ 98%).
 
-See **Engine families & validation** below for the accuracy/speed comparison.
+See **Engine families & validation** below for the full speed/accuracy table.
 
 ## Components
 
@@ -35,8 +48,19 @@ See **Engine families & validation** below for the accuracy/speed comparison.
 | `gangnam4_cuda/run_engine.py` | **Dispatcher** — selects engine (`--engine edge\|lane`) × backend (`--backend cpu\|gpu`) and forwards remaining args to the chosen simulator. `--list` shows options, `--dry-run` prints the command. | `python3 run_engine.py --engine lane --backend cpu ...` |
 | `gangnam4_cuda/run_compare_sumo.py` | **Engine-agnostic validation harness** — same data, swap engine via `--engine {edge,lane} --backend {cpu,gpu}`. Routes through the dispatcher, handles edge-vs-lane output schema differences, compares against SUMO edgedata (`--run-sumo`/`--sumo-edgedata`) or any edge-keyed CSV (`--ref-edge-csv`). Reports Pearson r / MAE / RMSE on speed·density·flow and worst-K congestion-hotspot Jaccard overlap. | `python3 run_compare_sumo.py --engine lane --run-sumo ...` |
 | `gangnam4_cuda/cell_common.py`, `cell_cpu_simulator.py` | **Multi-cell CTM** — subdivides each lane into ~15 m cells. Experiment; no accuracy gain for time-averaged metrics (kept for time-resolved/packet follow-ups). | `python3 cell_cpu_simulator.py` |
-| `gangnam4_cuda/meso_common.py`, `meso_sim.py` | **Mesoscopic engine** — vehicle loader + time-stepped spatial-queue simulator. Outputs per-vehicle travel times + edge density/speed/measured-throughput. | `python3 meso_sim.py --vmax-scale 0.5` |
-| `gangnam4_cuda/compare_tripinfo.py` | Per-vehicle travel-time comparison: SUMO `tripinfo` vs meso trip CSV (matched by vehicle id; Pearson r / MAE / bias). | `python3 compare_tripinfo.py --sumo-tripinfo ... --meso-trips ...` |
+| `gangnam4_cuda/meso_common.py`, `meso_sim.py` | **Mesoscopic engine (CPU)** — vehicle loader + time-stepped spatial-queue simulator (dynamic position advance, optional `--junction-delay` + `--junction-cong-coef` for congestion-dependent intersection delay). Outputs per-vehicle travel times + edge density/speed/measured throughput. `--track-vehicle` dumps a single-vehicle trajectory. | `python3 meso_sim.py --vmax-scale 0.5` |
+| `gangnam4_cuda/meso_gpu.py` | Naive cupy port of `meso_sim.py` (device-resident arrays + `cupyx.scatter_add` + `cp.lexsort`). Bit-exact vs CPU but capped near the classical 10× GPU mesoscopic ceiling. Kept for the *baseline* comparison only. | `python3 meso_gpu.py` |
+| `gangnam4_cuda/meso_gpu_graph.py` | **Redesigned meso-GPU** — branch-free, sync-free, atomic-ticket FIFO; whole step captured as a CUDA Graph and replayed. **172× over the naive port** at same accuracy (per-veh r matches CPU to 3 decimals via leave→snapshot→enter split). | `python3 meso_gpu_graph.py --junction-cong-coef 10` |
+| `gangnam4_cuda/compare_tripinfo.py` | Per-vehicle travel-time comparison: SUMO `tripinfo` vs meso trip CSV (id-matched; Pearson r / Spearman / MAPE / bias / KS). | `python3 compare_tripinfo.py --sumo-tripinfo ... --meso-trips ...` |
+| `gangnam4_cuda/metrics.py` | Pure-numpy traffic-standard metrics: GEH<5, RMSN, Spearman, KS, precision/recall@K (no scipy). Shared by the validation harnesses. | imported |
+| `gangnam4_cuda/run_sumo_seeds.py` | Multi-seed SUMO runner → per-edge mean/CI ground truth + cross-seed **noise floor** (SUMO is near-deterministic at edge level: flow ρ ≈ 0.999 between seeds, the irreducible ceiling). | `python3 run_sumo_seeds.py --seeds 10` |
+| `gangnam4_cuda/scale_demand.py` | Subsample/replicate a route file to any vehicle count (handles standalone `<route id>` and inline `<vehicle><route .../></vehicle>` forms — duarouter compatibility). | `python3 scale_demand.py --target 500000` |
+| `gangnam4_cuda/calibrate.py` | Held-out grid search over (`vmax_scale`, `major_left`, `minor`) on a *train* scenario; evaluate frozen params on a *test* scenario; report train↔test generalization gap (Spearman, comparable across demand levels). | `python3 calibrate.py --train-route ... --test-route ...` |
+| `gangnam4_cuda/make_synthetic_scenarios.py` | Generate grid/spider/random networks via SUMO `netgenerate` + `randomTrips` + `duarouter` (in-container, no internet). The grid topology brings the **140-signal scenario** Gangnam-4 lacks. | `python3 make_synthetic_scenarios.py --scenarios grid` |
+| `gangnam4_cuda/run_benchmark.py` | **Unified 4(+1)-system perf harness** — times SUMO / macro-CPU / meso-CPU / meso-GPU(naive) / meso-GPU(graph) on identical inputs with warmup + N repeats; reports sim_wall, total_wall, RTF, peak RSS, speedup. | `python3 run_benchmark.py --systems sumo,macro_cpu,meso_cpu,meso_gpu_graph` |
+| `gangnam4_cuda/run_pareto.py` | **E1 Pareto data** — sweeps (system × calibration) configs, logs (wall, GEH<5, flow/speed/density ρ, hotspot precision) per point. Output is Figure-1 raw data. | `python3 run_pareto.py --sumo-edgedata ... ` |
+| `gangnam4_cuda/run_scaling.py` | **E2 scaling sweep** — vehicle count 10k→1M, measures wall/throughput per engine. Demonstrates `O(edges)` macro vs `O(vehicles)` meso scaling. | `python3 run_scaling.py --counts 10000,...,1000000` |
+| `gangnam4_cuda/run_matrix.py`, `launch_matrix_tmux.sh` | **Long matrix sweep** — iterates (network × demand × config) combos; per combo: scale_demand → SUMO ref → run_pareto → master CSV. Streams `[COMBO]/[ETA]/[OK]` markers, supports `--resume`. Tmux launcher (`start \| --status \| --tail \| --attach \| --resume \| --kill`) makes it detach-safe through SSH disconnects. | `bash launch_matrix_tmux.sh start` |
 
 ## Data flow
 
@@ -198,19 +222,40 @@ capacity), both default 1.0 (off).
 
 | Engine (config) | speed r | density r | flow r | hotspot top-100 | 1-h wall |
 | --- | --- | --- | --- | --- | --- |
-| edge macro LWR | 0.01 | 0.10 | 0.27 | 4/100 | ~70 s (CPU) |
-| lane CTM (no calib) | 0.06 | 0.26 | 0.66 | 1/100 | 0.09 s (GPU) |
-| lane CTM + vmax 0.35 | 0.16 | 0.28 | 0.70 | 14/100 | 0.09 s (GPU) |
-| lane CTM + vmax 0.35 + HCM 0.7/0.5 | **0.22** | 0.35 | 0.69 | **15/100** | 0.09 s (GPU) |
-| **meso (vmax 0.5)** | **0.37** | **0.42** | **0.84** | 7/100 | ~24 s (CPU) |
+| edge macro LWR (CPU) | 0.01 | 0.10 | 0.27 | 4/100 | ~70 s |
+| lane CTM (no calib, GPU) | 0.06 | 0.26 | 0.66 | 1/100 | 0.09 s |
+| lane CTM + vmax 0.35 (GPU) | 0.16 | 0.28 | 0.70 | 14/100 | 0.09 s |
+| lane CTM + vmax 0.35 + HCM 0.7/0.5 (GPU) | **0.22** | 0.35 | 0.69 | **15/100** | 0.09 s |
+| meso CPU (vmax 0.5) | **0.37** | **0.42** | **0.84** | 7/100 | ~24 s |
+| meso GPU naive (cupy port) | = CPU meso (bit-exact) | | | | ~20 s (10× ceiling) |
+| **meso GPU graph (branch-free + CUDA Graph)** | = CPU meso (3-dec match) | | | | **0.12 s @ 100k, 0.45 s @ 1M** |
 
-Takeaways: the lane-CTM GPU path is the **speed champion** (sub-0.1 s) and best
-at *ranking* the worst congestion edges. The **mesoscopic engine** is the
-**accuracy champion** on flow/speed/density because its queue dynamics track
-real congestion, and it uniquely yields per-vehicle travel times
-(`compare_tripinfo.py`). Negative results (documented in git history): aggregate
-junction capacity, multi-cell spatial refinement, and stochastic flow noise did
-not improve the time-averaged metrics.
+Takeaways: GPU lane-CTM is the **speed champion** at very-large scale and best
+at *ranking* the worst-congestion edges. The mesoscopic engine is the **flow
+accuracy champion** (queue dynamics; uniquely yields per-vehicle travel times).
+The **redesigned meso-GPU** breaks the classical 10× GPU-meso ceiling — by
+killing host sync / flatnonzero / many-small-launches (NOT by removing the
+sort — that was only 1.1×), it reaches macro-CTM speed regime *while keeping
+meso accuracy*. **No accuracy is given up for the 172× speedup.**
+
+The clean per-vehicle validation on Gangnam-20k:
+
+| engine | per-vehicle Pearson r | bias | wall (7200 step) |
+| --- | --- | --- | --- |
+| meso CPU | 0.484 | −106 s | 7 s |
+| meso GPU (graph, single discharge) | 0.455 | −163 s | 0.20 s |
+| **meso GPU (graph, split-discharge)** | **0.484** | −228 s | 0.21 s |
+
+Junction-delay refinements: a *flat* per-crossing delay trades correlation for
+bias (r 0.445 → 0.386). The Webster-overflow-like **congestion-dependent
+delay** (`base + coef·occ/(1−occ)`) improves *both* (r 0.445 → 0.484, bias
+−628 → −106 s) — the first model change that does so. The grid scenario (140
+signals) confirms this is physically correct: junction-delay closes the
+travel-time MAPE 45% → 16% there *without* hurting r=0.94.
+
+Negative results (documented in git): aggregate junction-capacity cap,
+multi-cell spatial refinement, and stochastic flow noise did not improve the
+time-averaged metrics.
 
 ## Runtime / deployment
 
